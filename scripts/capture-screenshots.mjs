@@ -27,6 +27,18 @@ const TARGETS = [
   { path: '/pricing', name: 'pricing-1280', width: 1280, height: 900 },
   { path: '/verticali/dental', name: 'dental-1280', width: 1280, height: 900 },
   { path: '/status', name: 'status-1280', width: 1280, height: 900 },
+  {
+    path: '/demo/scheduling-advisor',
+    name: 'scheduling-advisor-demo-1440',
+    width: 1440,
+    height: 900,
+  },
+  {
+    path: '/demo/scheduling-advisor',
+    name: 'scheduling-advisor-demo-mobile',
+    width: 390,
+    height: 844,
+  },
 ];
 
 mkdirSync(outputDir, { recursive: true });
