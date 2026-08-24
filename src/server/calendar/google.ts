@@ -27,6 +27,14 @@ export type GoogleCalendarIntegration = {
 export type GoogleCalendarEventInput = {
   appointmentId: string;
   tenantId: string;
+  /**
+   * Identita' operativa dell'evento su Google.
+   *
+   * Su `createEvent` viene inviata come `id` nel body: Google accetta id
+   * forniti dal chiamante e rifiuta con 409 un id gia' esistente, quindi un
+   * insert ripetuto non puo' produrre un secondo evento logico.
+   */
+  eventId?: string;
   calendarId?: string;
   summary: string;
   description?: string;
@@ -37,12 +45,35 @@ export type GoogleCalendarEventInput = {
   customerName: string;
   customerPhone?: string | null;
   customerEmail?: string | null;
+  /**
+   * Stato Google da imporre sull'evento.
+   *
+   * Usato dalla convergenza per riportare a `confirmed` un evento che un
+   * operatore aveva eliminato a mano: senza, una PATCH di soli orari
+   * "riuscirebbe" su una tombstone e la riga risulterebbe sincronizzata.
+   */
+  status?: string;
 };
 
 export type GoogleCalendarEventResult = {
   eventId: string;
   htmlLink: string | null;
   raw: unknown;
+};
+
+/**
+ * Stato osservato di un evento remoto.
+ *
+ * `status` e' quello di Google (`confirmed` | `tentative` | `cancelled`):
+ * un evento eliminato resta leggibile per id con status `cancelled`, e la
+ * convergenza deve trattarlo come divergente, non come allineato.
+ */
+export type GoogleCalendarEventSnapshot = {
+  eventId: string;
+  htmlLink: string | null;
+  status: string | null;
+  start: Date | null;
+  end: Date | null;
 };
 
 type Fetcher = typeof fetch;
@@ -131,6 +162,56 @@ export class GoogleCalendarProvider {
       .filter((interval) => interval.start < interval.end);
   }
 
+  /**
+   * Legge un evento per id.
+   *
+   * Ritorna `null` quando Google risponde 404/410: per la convergenza
+   * "non esiste" e' un esito normale, non un errore. Leggere prima di
+   * scrivere e' cio' che rende sicura la ripetizione di un insert il cui
+   * esito era stato perso: la creazione parte solo se l'evento davvero
+   * non c'e'.
+   */
+  async getEvent(input: {
+    integration: GoogleCalendarIntegration;
+    eventId: string;
+    calendarId?: string;
+  }): Promise<GoogleCalendarEventSnapshot | null> {
+    const calendarId = input.calendarId ?? calendarIdForIntegration(input.integration);
+    const accessToken = await this.getAccessToken(input.integration);
+    const url = new URL(
+      `${this.apiBaseUrl}/calendars/${encodeURIComponent(
+        calendarId,
+      )}/events/${encodeURIComponent(input.eventId)}`,
+    );
+
+    const response = await this.fetcher(url.toString(), {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (response.status === 404 || response.status === 410) {
+      return null;
+    }
+
+    const rawBody = await readJson(response);
+
+    if (!response.ok) {
+      throw googleCalendarError('Google Calendar event read failed', response, rawBody);
+    }
+
+    const body: GoogleCalendarEventResponse = parseGoogleCalendarEventResponse(rawBody);
+
+    return {
+      eventId: body.id ?? input.eventId,
+      htmlLink: body.htmlLink ?? null,
+      status: body.status ?? null,
+      start: optionalGoogleDate(body.start?.dateTime),
+      end: optionalGoogleDate(body.end?.dateTime),
+    };
+  }
+
   async createEvent(
     input: GoogleCalendarEventInput & {
       integration: GoogleCalendarIntegration;
@@ -149,6 +230,7 @@ export class GoogleCalendarProvider {
         'content-type': 'application/json',
       },
       body: JSON.stringify({
+        ...(input.eventId ? { id: input.eventId } : {}),
         ...googleCalendarEventBody(input),
       }),
     });
@@ -305,6 +387,7 @@ export class GoogleCalendarProvider {
 
 function googleCalendarEventBody(input: GoogleCalendarEventInput): Record<string, unknown> {
   return {
+    ...(input.status ? { status: input.status } : {}),
     summary: input.summary,
     description: input.description,
     location: input.location,
@@ -361,6 +444,20 @@ function attendeeList(
   const email = customerEmail?.trim();
 
   return email ? [{ email }] : undefined;
+}
+
+/**
+ * Variante non fatale di `parseGoogleDate`: un estremo assente o all-day
+ * diventa `null`, che la convergenza legge come divergenza.
+ */
+function optionalGoogleDate(value: string | undefined): Date | null {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(value);
+
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function parseGoogleDate(value: string | undefined): Date {

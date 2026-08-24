@@ -72,15 +72,37 @@ export const GoogleFreeBusyResponseSchema = z
 export type GoogleFreeBusyResponse = z.infer<typeof GoogleFreeBusyResponseSchema>;
 
 /**
- * Subset della risposta di POST/PATCH events.
+ * Estremo temporale di un evento Google.
  *
- * Google ritorna molti più campi (start, end, attendees, ecc.) ma noi
- * leggiamo solo `id` e `htmlLink`.
+ * Google usa `dateTime` per gli eventi con orario e `date` per quelli
+ * all-day: gli appuntamenti sono sempre del primo tipo, ma la convergenza
+ * deve saper riconoscere il secondo caso come divergenza invece di
+ * ignorarlo silenziosamente.
+ */
+export const GoogleCalendarEventDateTimeSchema = z
+  .object({
+    dateTime: z.string().optional(),
+    date: z.string().optional(),
+    timeZone: z.string().optional(),
+  })
+  .passthrough();
+
+/**
+ * Subset della risposta di GET/POST/PATCH events.
+ *
+ * Oltre a `id` e `htmlLink` leggiamo `status`, `start` e `end`: sono i campi
+ * che la routine di convergenza confronta con Postgres per decidere se
+ * l'evento remoto e' gia' allineato. Senza `status` non potremmo distinguere
+ * un evento attivo da una tombstone `cancelled`, che Google continua a
+ * restituire su GET per id.
  */
 export const GoogleCalendarEventResponseSchema = z
   .object({
     id: z.string().optional(),
     htmlLink: z.string().optional(),
+    status: z.string().optional(),
+    start: GoogleCalendarEventDateTimeSchema.optional(),
+    end: GoogleCalendarEventDateTimeSchema.optional(),
   })
   .passthrough();
 

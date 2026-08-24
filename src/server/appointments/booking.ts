@@ -1,13 +1,22 @@
 import { randomUUID } from 'node:crypto';
 
 import { AppError } from '@/lib/errors/app-error';
+import { logger } from '@/lib/logging/logger';
 import { createSupabaseAdminClient } from '@/lib/supabase/admin';
 import {
   GoogleCalendarProvider,
   type CalendarBusyInterval,
-  type GoogleCalendarEventResult,
   type GoogleCalendarIntegration,
 } from '@/server/calendar/google';
+import {
+  CALENDAR_SYNC_MAX_ATTEMPTS,
+  calculateCalendarSyncNextAttemptAt,
+  convergeCalendarEvent,
+  deriveCalendarEventId,
+  isNonRetryableCalendarError,
+  type CalendarConvergenceProvider,
+  type CalendarConvergenceTarget,
+} from '@/server/appointments/calendar-convergence';
 import { createAppointmentNotificationService } from '@/server/appointments/notifications';
 import { encryptedCredentialPatch } from '@/server/integrations/credential-encryption';
 
@@ -65,6 +74,21 @@ export type InsertAppointmentInput = {
   bookingSource: BookingSource;
   calendarProvider: 'google_calendar' | null;
   calendarSyncStatus: CalendarSyncStatus;
+  /**
+   * Identita' Google, derivata dall'id e scritta nello STESSO insert della
+   * prenotazione. E' cio' che rende impossibile l'evento orfano: non esiste
+   * un istante in cui l'appuntamento e' committato senza sapere quale evento
+   * gli appartiene.
+   */
+  calendarEventId: string | null;
+  /**
+   * Momento del primo tentativo utile per lo scanner.
+   *
+   * Valorizzato nell'insert quando Google e' configurato: se il processo
+   * muore subito dopo il commit, prima ancora di chiamare Google, la riga e'
+   * gia' recuperabile dal cron.
+   */
+  calendarSyncNextAttemptAt: Date | null;
 };
 
 export type CreatedAppointment = {
@@ -96,46 +120,18 @@ export type AppointmentForChange = {
   notes: string | null;
 };
 
-export type AppointmentCalendarProvider = {
+/**
+ * Il servizio di booking parla con Google solo attraverso la porta della
+ * convergenza, piu' la lettura delle fasce occupate che serve al calcolo
+ * della disponibilita'.
+ */
+export type AppointmentCalendarProvider = CalendarConvergenceProvider & {
   listBusy(input: {
     integration: GoogleCalendarIntegration;
     from: Date;
     to: Date;
     timezone: string;
   }): Promise<CalendarBusyInterval[]>;
-  createEvent(input: {
-    integration: GoogleCalendarIntegration;
-    appointmentId: string;
-    tenantId: string;
-    summary: string;
-    description?: string;
-    location?: string;
-    start: Date;
-    end: Date;
-    timezone: string;
-    customerName: string;
-    customerPhone?: string | null;
-    customerEmail?: string | null;
-  }): Promise<GoogleCalendarEventResult>;
-  updateEvent(input: {
-    integration: GoogleCalendarIntegration;
-    eventId: string;
-    appointmentId: string;
-    tenantId: string;
-    summary: string;
-    description?: string;
-    location?: string;
-    start: Date;
-    end: Date;
-    timezone: string;
-    customerName: string;
-    customerPhone?: string | null;
-    customerEmail?: string | null;
-  }): Promise<GoogleCalendarEventResult>;
-  cancelEvent(input: {
-    integration: GoogleCalendarIntegration;
-    eventId: string;
-  }): Promise<{ cancelled: true }>;
 };
 
 export type AppointmentNotificationEnqueuer = {
@@ -160,13 +156,24 @@ export type AppointmentBookingRepository = {
     excludeAppointmentId?: string;
   }): Promise<CalendarBusyInterval[]>;
   insertAppointment(input: InsertAppointmentInput): Promise<CreatedAppointment>;
+  /**
+   * Registra l'esito di UN tentativo di convergenza.
+   *
+   * `eventId` e `htmlLink` sono opzionali e vengono scritti solo se passati:
+   * un esito di fallimento non li passa mai, cosi' l'identita' memorizzata
+   * non puo' essere cancellata da un errore. E' la regola che chiude il caso
+   * "evento creato su Google, risposta persa, puntatore azzerato".
+   */
   updateAppointmentCalendarSync(input: {
     tenantId: string;
     appointmentId: string;
     status: CalendarSyncStatus;
-    eventId?: string | null;
+    eventId?: string;
     htmlLink?: string | null;
-    errorMessage?: string | null;
+    errorMessage: string | null;
+    attempts: number;
+    nextAttemptAt: Date | null;
+    lastAttemptAt: Date;
   }): Promise<void>;
   updateGoogleCalendarAccessToken(input: {
     tenantId: string;
@@ -188,12 +195,13 @@ export type AppointmentBookingRepository = {
     notes: string | null;
     calendarProvider: 'google_calendar' | null;
     calendarSyncStatus: CalendarSyncStatus;
+    calendarSyncNextAttemptAt: Date | null;
   }): Promise<void>;
   cancelAppointmentRecord(input: {
     tenantId: string;
     appointmentId: string;
     calendarSyncStatus: CalendarSyncStatus;
-    errorMessage?: string | null;
+    calendarSyncNextAttemptAt: Date | null;
   }): Promise<void>;
 };
 
@@ -330,6 +338,13 @@ type AppointmentRow = {
   notes: string | null;
 };
 
+/**
+ * Marcatore delle righe che precedono l'identita' derivata e per cui la
+ * riconciliazione automatica non e' sicura.
+ */
+export const LEGACY_MISSING_EVENT_ID_ERROR =
+  'Legacy appointment without calendar_event_id: manual operator resolution required';
+
 export class AppointmentBookingService {
   constructor(
     private readonly repository: AppointmentBookingRepository,
@@ -412,8 +427,16 @@ export class AppointmentBookingService {
       throw new AppError('conflict', 'Requested appointment slot is unavailable');
     }
 
+    const now = input.now ?? new Date();
+    const appointmentId = input.appointmentId ?? randomUUID();
+    const integration = context.googleCalendarIntegration;
+    // L'identita' Google nasce insieme alla prenotazione, non dopo la
+    // chiamata a Google: e' un valore derivato dall'id, quindi calcolabile
+    // prima che esista qualunque evento remoto.
+    const calendarEventId = integration ? deriveCalendarEventId(appointmentId) : null;
+
     const appointment = await this.repository.insertAppointment({
-      id: input.appointmentId ?? randomUUID(),
+      id: appointmentId,
       tenantId: input.tenantId,
       conversationId: input.conversationId ?? null,
       serviceId: input.serviceId,
@@ -425,56 +448,53 @@ export class AppointmentBookingService {
       durationMinutes,
       notes: input.notes?.trim() || null,
       bookingSource: input.bookingSource ?? 'whatsapp_ai',
-      calendarProvider: context.googleCalendarIntegration ? 'google_calendar' : null,
-      calendarSyncStatus: context.googleCalendarIntegration ? 'pending' : 'not_configured',
+      calendarProvider: integration ? 'google_calendar' : null,
+      calendarSyncStatus: integration ? 'pending' : 'not_configured',
+      calendarEventId,
+      calendarSyncNextAttemptAt: integration ? now : null,
     });
 
     let calendarSyncStatus = appointment.calendarSyncStatus;
-    let calendarEventId = appointment.calendarEventId;
     let calendarEventHtmlLink = appointment.calendarEventHtmlLink;
 
-    if (context.googleCalendarIntegration) {
-      try {
-        const event = await this.calendarProvider.createEvent({
-          integration: context.googleCalendarIntegration,
-          appointmentId: appointment.id,
+    // Da qui in poi la prenotazione e' salva. La convergenza in linea serve
+    // solo a far trovare l'evento sul calendario subito: se fallisce, o se
+    // il processo muore, la riga resta recuperabile dal cron.
+    if (integration && calendarEventId) {
+      const sync = await this.syncAppointmentCalendar({
+        tenantId: input.tenantId,
+        appointmentId,
+        integration,
+        attempts: 0,
+        now,
+        target: {
           tenantId: input.tenantId,
-          summary: `${context.studioName}: ${context.service.name} - ${input.customerName}`,
+          appointmentId,
+          eventId: calendarEventId,
+          status: 'confirmed',
+          start: scheduledAt,
+          end: endsAt,
+          timezone: context.timezone,
+          summary: buildAppointmentCalendarSummary({
+            studioName: context.studioName,
+            serviceName: context.service.name,
+            customerName: input.customerName,
+          }),
           description: appointmentDescription(input, context),
           ...(context.address !== null && context.address !== undefined
             ? { location: context.address }
             : {}),
-          start: scheduledAt,
-          end: endsAt,
-          timezone: context.timezone,
           customerName: input.customerName,
           ...(input.customerPhone !== undefined ? { customerPhone: input.customerPhone } : {}),
           ...(input.customerEmail !== undefined ? { customerEmail: input.customerEmail } : {}),
-        });
+        },
+      });
 
-        await this.repository.updateAppointmentCalendarSync({
-          tenantId: input.tenantId,
-          appointmentId: appointment.id,
-          status: 'synced',
-          eventId: event.eventId,
-          htmlLink: event.htmlLink,
-        });
-        calendarSyncStatus = 'synced';
-        calendarEventId = event.eventId;
-        calendarEventHtmlLink = event.htmlLink;
-      } catch (error) {
-        await this.repository.updateAppointmentCalendarSync({
-          tenantId: input.tenantId,
-          appointmentId: appointment.id,
-          status: 'failed',
-          errorMessage: error instanceof Error ? error.message : 'unknown error',
-        });
+      calendarSyncStatus = sync.status;
+      calendarEventHtmlLink = sync.htmlLink;
 
-        if (input.requireCalendarSync ?? true) {
-          throw error;
-        }
-
-        calendarSyncStatus = 'failed';
+      if (sync.error && (input.requireCalendarSync ?? true)) {
+        throw sync.error;
       }
     }
 
@@ -532,84 +552,79 @@ export class AppointmentBookingService {
       throw new AppError('conflict', 'Requested appointment slot is unavailable');
     }
 
-    const hasCalendar = Boolean(context.googleCalendarIntegration);
+    const now = input.now ?? new Date();
+    const integration = context.googleCalendarIntegration;
+    // Postgres per primo, come nella creazione: da qui in avanti l'orario
+    // nuovo e' quello vero, e Google e' semplicemente indietro.
     await this.repository.updateAppointmentSchedule({
       tenantId: input.tenantId,
       appointmentId: appointment.id,
       scheduledAt,
       durationMinutes,
       notes: input.notes?.trim() || appointment.notes,
-      calendarProvider: hasCalendar ? 'google_calendar' : null,
-      calendarSyncStatus: hasCalendar ? 'pending' : 'not_configured',
+      calendarProvider: integration ? 'google_calendar' : null,
+      calendarSyncStatus: integration ? 'pending' : 'not_configured',
+      calendarSyncNextAttemptAt: integration ? now : null,
     });
 
-    let calendarSyncStatus: CalendarSyncStatus = hasCalendar ? 'pending' : 'not_configured';
-    let calendarEventId = appointment.calendarEventId;
+    let calendarSyncStatus: CalendarSyncStatus = integration ? 'pending' : 'not_configured';
+    // Identita' memorizzata, mai ricalcolata: le righe storiche portano id
+    // generati da Google e devono continuare a operare sui propri.
+    const calendarEventId = appointment.calendarEventId;
     let calendarEventHtmlLink = appointment.calendarEventHtmlLink;
 
-    if (context.googleCalendarIntegration) {
-      try {
-        const calendarEventInput = {
-          integration: context.googleCalendarIntegration,
-          appointmentId: appointment.id,
-          tenantId: input.tenantId,
-          summary: `${context.studioName}: ${context.service.name} - ${appointment.customerName}`,
-          description: appointmentDescription(
-            {
+    if (integration) {
+      const sync = await this.syncAppointmentCalendar({
+        tenantId: input.tenantId,
+        appointmentId: appointment.id,
+        integration,
+        attempts: 0,
+        now,
+        target: calendarEventId
+          ? {
               tenantId: input.tenantId,
-              serviceId,
-              customerIdentifier: appointment.customerIdentifier,
+              appointmentId: appointment.id,
+              eventId: calendarEventId,
+              status: 'confirmed',
+              start: scheduledAt,
+              end: endsAt,
+              timezone: context.timezone,
+              summary: buildAppointmentCalendarSummary({
+                studioName: context.studioName,
+                serviceName: context.service.name,
+                customerName: appointment.customerName,
+              }),
+              description: appointmentDescription(
+                {
+                  tenantId: input.tenantId,
+                  serviceId,
+                  customerIdentifier: appointment.customerIdentifier,
+                  customerName: appointment.customerName,
+                  customerPhone: appointment.customerPhone,
+                  ...(input.customerEmail !== undefined
+                    ? { customerEmail: input.customerEmail }
+                    : {}),
+                  scheduledAt,
+                  durationMinutes,
+                  notes: input.notes ?? appointment.notes,
+                },
+                context,
+              ),
+              ...(context.address !== null && context.address !== undefined
+                ? { location: context.address }
+                : {}),
               customerName: appointment.customerName,
               customerPhone: appointment.customerPhone,
               ...(input.customerEmail !== undefined ? { customerEmail: input.customerEmail } : {}),
-              scheduledAt,
-              durationMinutes,
-              notes: input.notes ?? appointment.notes,
-            },
-            context,
-          ),
-          ...(context.address !== null && context.address !== undefined
-            ? { location: context.address }
-            : {}),
-          start: scheduledAt,
-          end: endsAt,
-          timezone: context.timezone,
-          customerName: appointment.customerName,
-          customerPhone: appointment.customerPhone,
-          ...(input.customerEmail !== undefined ? { customerEmail: input.customerEmail } : {}),
-        };
-        const event = appointment.calendarEventId
-          ? await this.calendarProvider.updateEvent({
-              ...calendarEventInput,
-              eventId: appointment.calendarEventId,
-            })
-          : await this.calendarProvider.createEvent(calendarEventInput);
+            }
+          : null,
+      });
 
-        await this.repository.updateAppointmentCalendarSync({
-          tenantId: input.tenantId,
-          appointmentId: appointment.id,
-          status: 'synced',
-          eventId: event.eventId,
-          htmlLink: event.htmlLink,
-        });
-        calendarSyncStatus = 'synced';
-        calendarEventId = event.eventId;
-        calendarEventHtmlLink = event.htmlLink;
-      } catch (error) {
-        await this.repository.updateAppointmentCalendarSync({
-          tenantId: input.tenantId,
-          appointmentId: appointment.id,
-          status: 'failed',
-          eventId: appointment.calendarEventId,
-          htmlLink: appointment.calendarEventHtmlLink,
-          errorMessage: error instanceof Error ? error.message : 'unknown error',
-        });
+      calendarSyncStatus = sync.status;
+      calendarEventHtmlLink = sync.htmlLink;
 
-        if (input.requireCalendarSync ?? true) {
-          throw error;
-        }
-
-        calendarSyncStatus = 'failed';
+      if (sync.error && (input.requireCalendarSync ?? true)) {
+        throw sync.error;
       }
     }
 
@@ -645,46 +660,62 @@ export class AppointmentBookingService {
         })
       : null;
     const endsAt = addMinutes(appointment.scheduledAt, appointment.durationMinutes);
-    let calendarSyncStatus: CalendarSyncStatus = context?.googleCalendarIntegration
-      ? 'pending'
-      : 'not_configured';
+    const now = input.now ?? new Date();
+    const integration = context?.googleCalendarIntegration ?? null;
 
-    if (context?.googleCalendarIntegration && appointment.calendarEventId) {
-      try {
-        await this.calendarProvider.cancelEvent({
-          integration: context.googleCalendarIntegration,
-          eventId: appointment.calendarEventId,
-        });
-        calendarSyncStatus = 'synced';
-      } catch (error) {
-        await this.repository.updateAppointmentCalendarSync({
-          tenantId: input.tenantId,
-          appointmentId: appointment.id,
-          status: 'failed',
-          eventId: appointment.calendarEventId,
-          htmlLink: appointment.calendarEventHtmlLink,
-          errorMessage: error instanceof Error ? error.message : 'unknown error',
-        });
-
-        if (input.requireCalendarSync ?? true) {
-          throw error;
-        }
-
-        calendarSyncStatus = 'failed';
-      }
-    } else if (context?.googleCalendarIntegration) {
-      calendarSyncStatus = 'failed';
-    }
-
+    // L'ordine qui era invertito, e l'inversione era il difetto piu' grave
+    // del percorso: si cancellava prima su Google e solo dopo su Postgres.
+    // Se la seconda scrittura falliva restava un appuntamento `confirmed`
+    // con stato di sincronizzazione `synced` e nessun evento sul calendario:
+    // un impegno preso con il cliente, invisibile all'operatore, e fuori
+    // dalla portata di qualunque riconciliazione, perche' nessuna colonna
+    // segnalava che c'era qualcosa da sistemare.
     await this.repository.cancelAppointmentRecord({
       tenantId: input.tenantId,
       appointmentId: appointment.id,
-      calendarSyncStatus,
-      errorMessage:
-        calendarSyncStatus === 'failed' && context?.googleCalendarIntegration
-          ? 'Appointment is missing Google Calendar event id'
-          : null,
+      calendarSyncStatus: integration ? 'pending' : 'not_configured',
+      calendarSyncNextAttemptAt: integration ? now : null,
     });
+
+    let calendarSyncStatus: CalendarSyncStatus = integration ? 'pending' : 'not_configured';
+
+    if (integration) {
+      const sync = await this.syncAppointmentCalendar({
+        tenantId: input.tenantId,
+        appointmentId: appointment.id,
+        integration,
+        attempts: 0,
+        now,
+        target: appointment.calendarEventId
+          ? {
+              tenantId: input.tenantId,
+              appointmentId: appointment.id,
+              eventId: appointment.calendarEventId,
+              status: 'cancelled',
+              start: appointment.scheduledAt,
+              end: endsAt,
+              timezone: context?.timezone ?? 'Europe/Rome',
+              summary: appointment.serviceName ?? 'Appuntamento',
+              customerName: appointment.customerName,
+              customerPhone: appointment.customerPhone,
+            }
+          : null,
+      });
+
+      calendarSyncStatus = sync.status;
+
+      // Nessun rilancio, nemmeno con `requireCalendarSync`. A questo punto la
+      // cancellazione autorevole e' gia' committata: sollevare direbbe al
+      // chiamante che l'operazione non e' avvenuta, quando invece e' avvenuta
+      // ed e' definitiva. Il chiamante ritenterebbe una cancellazione che non
+      // puo' piu' riuscire — l'appuntamento non e' piu' `confirmed` — e il
+      // cliente non riceverebbe la notifica di un annullamento reale.
+      // Il fallimento di Google resta registrato e ritentabile: e' una
+      // proiezione che converge, non parte dell'esito dell'operazione.
+      // `requireCalendarSync` resta nella firma per compatibilita' con i
+      // chiamanti esistenti, ma sul percorso di cancellazione non governa piu'
+      // il rilancio.
+    }
 
     const cancellation = await this.enqueueNotificationSafely({
       tenantId: input.tenantId,
@@ -706,6 +737,125 @@ export class AppointmentBookingService {
       notificationQueued: cancellation.queued,
       notificationErrorCode: cancellation.errorCode,
     };
+  }
+
+  /**
+   * Esegue UN tentativo di convergenza e ne registra l'esito in modo
+   * durevole. E' l'unico punto in cui i tre percorsi di scrittura toccano
+   * Google, ed e' lo stesso codice che usa il reconciler.
+   *
+   * Non solleva mai per conto proprio: restituisce l'errore al chiamante,
+   * che decide se propagarlo (`requireCalendarSync`). La prenotazione, a
+   * questo punto, e' gia' committata: farla fallire per un guasto di Google
+   * significherebbe perdere l'unica cosa che il sistema aveva garantito.
+   */
+  private async syncAppointmentCalendar(input: {
+    tenantId: string;
+    appointmentId: string;
+    integration: GoogleCalendarIntegration;
+    /** `null` per le righe storiche senza identita' memorizzata. */
+    target: CalendarConvergenceTarget | null;
+    attempts: number;
+    now: Date;
+  }): Promise<{ status: CalendarSyncStatus; htmlLink: string | null; error: unknown }> {
+    if (!input.target) {
+      // Riga storica senza `calendar_event_id`: potrebbe avere gia' un evento
+      // remoto creato da una versione precedente e mai registrato. Derivare
+      // ora un id nuovo creerebbe il duplicato che tutto questo lavoro serve
+      // a rendere impossibile, quindi la riga diventa terminale e passa
+      // all'operatore invece che al retry automatico.
+      await this.settleCalendarSyncSafely({
+        tenantId: input.tenantId,
+        appointmentId: input.appointmentId,
+        status: 'failed',
+        errorMessage: LEGACY_MISSING_EVENT_ID_ERROR,
+        attempts: CALENDAR_SYNC_MAX_ATTEMPTS,
+        nextAttemptAt: calculateCalendarSyncNextAttemptAt(input.now, CALENDAR_SYNC_MAX_ATTEMPTS),
+        lastAttemptAt: input.now,
+      });
+
+      return {
+        status: 'failed',
+        htmlLink: null,
+        error: new AppError('upstream_error', LEGACY_MISSING_EVENT_ID_ERROR, { expose: false }),
+      };
+    }
+
+    try {
+      const converged = await convergeCalendarEvent({
+        provider: this.calendarProvider,
+        integration: input.integration,
+        target: input.target,
+      });
+
+      await this.settleCalendarSyncSafely({
+        tenantId: input.tenantId,
+        appointmentId: input.appointmentId,
+        status: 'synced',
+        eventId: converged.eventId,
+        htmlLink: converged.htmlLink,
+        errorMessage: null,
+        attempts: input.attempts,
+        nextAttemptAt: null,
+        lastAttemptAt: input.now,
+      });
+
+      return { status: 'synced', htmlLink: converged.htmlLink, error: null };
+    } catch (error) {
+      const attempts = isNonRetryableCalendarError(error)
+        ? CALENDAR_SYNC_MAX_ATTEMPTS
+        : input.attempts + 1;
+
+      await this.settleCalendarSyncSafely({
+        tenantId: input.tenantId,
+        appointmentId: input.appointmentId,
+        status: 'failed',
+        errorMessage: error instanceof Error ? error.message : 'unknown error',
+        attempts,
+        // Sempre valorizzato, anche a tentativi esauriti: la terminalita' e'
+        // un predicato su stato/tentativi/data, non l'assenza di questa
+        // colonna. Un NULL qui significherebbe solo "non c'e' nulla da fare",
+        // e una riga rotta smetterebbe di essere distinguibile da una sana.
+        nextAttemptAt: calculateCalendarSyncNextAttemptAt(input.now, attempts),
+        lastAttemptAt: input.now,
+      });
+
+      return { status: 'failed', htmlLink: null, error };
+    }
+  }
+
+  /**
+   * La scrittura dell'esito non deve poter distruggere la prenotazione.
+   *
+   * Se fallisce, la riga resta com'era: `pending` con un `next_attempt_at`
+   * gia' scritto al momento dell'insert, quindi recuperabile dallo scanner.
+   * Propagare l'errore, invece, farebbe fallire una `createAppointment` il
+   * cui appuntamento e' gia' committato e valido.
+   */
+  private async settleCalendarSyncSafely(input: {
+    tenantId: string;
+    appointmentId: string;
+    status: CalendarSyncStatus;
+    eventId?: string;
+    htmlLink?: string | null;
+    errorMessage: string | null;
+    attempts: number;
+    nextAttemptAt: Date | null;
+    lastAttemptAt: Date;
+  }): Promise<void> {
+    try {
+      await this.repository.updateAppointmentCalendarSync(input);
+    } catch (error) {
+      logger.error(
+        {
+          tenantId: input.tenantId,
+          appointmentId: input.appointmentId,
+          status: input.status,
+          err: error,
+        },
+        'Failed to persist appointment calendar sync outcome',
+      );
+    }
   }
 
   private async enqueueConfirmationSafely(input: {
@@ -949,6 +1099,9 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
         booking_source: input.bookingSource,
         calendar_provider: input.calendarProvider,
         calendar_sync_status: input.calendarSyncStatus,
+        calendar_event_id: input.calendarEventId,
+        calendar_sync_attempts: 0,
+        calendar_sync_next_attempt_at: input.calendarSyncNextAttemptAt?.toISOString() ?? null,
       })
       .select(
         'id, tenant_id, scheduled_at, duration_minutes, calendar_sync_status, calendar_event_id, calendar_event_html_link',
@@ -980,18 +1133,39 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
     tenantId: string;
     appointmentId: string;
     status: CalendarSyncStatus;
-    eventId?: string | null;
+    eventId?: string;
     htmlLink?: string | null;
-    errorMessage?: string | null;
+    errorMessage: string | null;
+    attempts: number;
+    nextAttemptAt: Date | null;
+    lastAttemptAt: Date;
   }): Promise<void> {
+    // `calendar_event_id` e `calendar_event_html_link` entrano nella patch
+    // solo se il chiamante li passa. La versione precedente scriveva
+    // `input.eventId ?? null`, quindi ogni esito di fallimento azzerava
+    // l'identita' dell'evento: se Google aveva creato l'evento e la risposta
+    // era andata persa, il puntatore spariva e il ritentativo avrebbe
+    // prodotto un secondo evento.
+    const patch: Record<string, unknown> = {
+      calendar_sync_status: input.status,
+      calendar_sync_error: input.errorMessage ? input.errorMessage.slice(0, 1000) : null,
+      calendar_sync_attempts: input.attempts,
+      calendar_sync_next_attempt_at: input.nextAttemptAt?.toISOString() ?? null,
+      calendar_sync_last_attempt_at: input.lastAttemptAt.toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    if (input.eventId !== undefined) {
+      patch.calendar_event_id = input.eventId;
+    }
+
+    if (input.htmlLink !== undefined) {
+      patch.calendar_event_html_link = input.htmlLink;
+    }
+
     const { error } = await this.supabase
       .from('appointments')
-      .update({
-        calendar_sync_status: input.status,
-        calendar_event_id: input.eventId ?? null,
-        calendar_event_html_link: input.htmlLink ?? null,
-        calendar_sync_error: input.errorMessage ? input.errorMessage.slice(0, 1000) : null,
-      })
+      .update(patch)
       .eq('tenant_id', input.tenantId)
       .eq('id', input.appointmentId);
 
@@ -1051,8 +1225,9 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
     notes: string | null;
     calendarProvider: 'google_calendar' | null;
     calendarSyncStatus: CalendarSyncStatus;
+    calendarSyncNextAttemptAt: Date | null;
   }): Promise<void> {
-    const { error } = await this.supabase
+    const { data, error } = await this.supabase
       .from('appointments')
       .update({
         scheduled_at: input.scheduledAt.toISOString(),
@@ -1062,6 +1237,10 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
         calendar_provider: input.calendarProvider,
         calendar_sync_status: input.calendarSyncStatus,
         calendar_sync_error: null,
+        // Uno spostamento e' uno stato desiderato nuovo: i tentativi falliti
+        // sul precedente non devono consumare il budget di questo.
+        calendar_sync_attempts: 0,
+        calendar_sync_next_attempt_at: input.calendarSyncNextAttemptAt?.toISOString() ?? null,
         confirmation_queued_at: null,
         reminder_24h_queued_at: null,
         reminder_1h_queued_at: null,
@@ -1071,7 +1250,8 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
       })
       .eq('tenant_id', input.tenantId)
       .eq('id', input.appointmentId)
-      .eq('status', 'confirmed');
+      .eq('status', 'confirmed')
+      .select('id');
 
     if (error) {
       if (isAppointmentConflict(error)) {
@@ -1082,20 +1262,39 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
 
       throw toRepositoryError('Failed to update appointment schedule', error);
     }
+
+    // Zero righe aggiornate significa che il filtro `status = 'confirmed'` non
+    // ha trovato nulla: fra la lettura e questa scrittura l'appuntamento e'
+    // stato annullato da qualcun altro.
+    //
+    // Senza questo controllo l'UPDATE a vuoto passava inosservato e lo
+    // spostamento proseguiva verso Google. Li' la convergenza avrebbe trovato
+    // l'evento assente — l'annullamento concorrente lo aveva appena tolto — e
+    // lo avrebbe ricreato, resuscitando sul calendario dello studio un impegno
+    // che in Postgres non esiste piu'. La riga sarebbe poi stata marcata
+    // `synced`, quindi invisibile anche al reconciler.
+    //
+    // Fermarsi qui e' l'unica risposta onesta: lo stato autorevole e' cambiato
+    // sotto i piedi del chiamante, che deve rileggerlo.
+    if ((data ?? []).length === 0) {
+      throw new AppError('conflict', 'Appointment is no longer confirmed', { expose: false });
+    }
   }
 
   async cancelAppointmentRecord(input: {
     tenantId: string;
     appointmentId: string;
     calendarSyncStatus: CalendarSyncStatus;
-    errorMessage?: string | null;
+    calendarSyncNextAttemptAt: Date | null;
   }): Promise<void> {
     const { error } = await this.supabase
       .from('appointments')
       .update({
         status: 'cancelled',
         calendar_sync_status: input.calendarSyncStatus,
-        calendar_sync_error: input.errorMessage ? input.errorMessage.slice(0, 1000) : null,
+        calendar_sync_error: null,
+        calendar_sync_attempts: 0,
+        calendar_sync_next_attempt_at: input.calendarSyncNextAttemptAt?.toISOString() ?? null,
         reminder_24h_queued_at: null,
         reminder_1h_queued_at: null,
         updated_at: new Date().toISOString(),
@@ -1253,13 +1452,30 @@ function buildAvailableSlots(input: {
   return slots;
 }
 
-function appointmentDescription(
-  input: CreateAppointmentInput,
-  context: BookingServiceContext,
-): string {
+/**
+ * Titolo e descrizione dell'evento sono costruiti qui e SOLO qui.
+ *
+ * Il reconciler produce lo stesso testo del percorso in linea: se divergessero,
+ * ogni convergenza riscriverebbe il contenuto scritto dall'altra e il
+ * calendario dell'operatore cambierebbe da solo a ogni tick.
+ */
+export function buildAppointmentCalendarSummary(input: {
+  studioName: string;
+  serviceName: string;
+  customerName: string;
+}): string {
+  return `${input.studioName}: ${input.serviceName} - ${input.customerName}`;
+}
+
+export function buildAppointmentCalendarDescription(input: {
+  serviceName: string;
+  customerName: string;
+  customerPhone?: string | null | undefined;
+  notes?: string | null | undefined;
+}): string {
   const lines = [
     `Prenotazione creata da Ambrogio.ai`,
-    `Servizio: ${context.service.name}`,
+    `Servizio: ${input.serviceName}`,
     `Cliente: ${input.customerName}`,
   ];
 
@@ -1272,6 +1488,18 @@ function appointmentDescription(
   }
 
   return lines.join('\n');
+}
+
+function appointmentDescription(
+  input: CreateAppointmentInput,
+  context: BookingServiceContext,
+): string {
+  return buildAppointmentCalendarDescription({
+    serviceName: context.service.name,
+    customerName: input.customerName,
+    customerPhone: input.customerPhone,
+    notes: input.notes,
+  });
 }
 
 function groupBusinessHoursByWeekday(

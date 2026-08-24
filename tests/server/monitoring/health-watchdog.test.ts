@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   HealthWatchdogService,
+  type WatchdogCalendarStats,
   type WatchdogQueueStats,
   type WatchdogRepository,
 } from '@/server/monitoring/health-watchdog';
@@ -9,7 +10,10 @@ import type { EmailMessage, EmailSender, EmailSendResult } from '@/server/notifi
 
 const NOW = new Date('2026-07-27T12:00:00.000Z');
 
-function repositoryReturning(stats: Partial<WatchdogQueueStats>): WatchdogRepository {
+function repositoryReturning(
+  stats: Partial<WatchdogQueueStats>,
+  calendar: Partial<WatchdogCalendarStats> = {},
+): WatchdogRepository {
   return {
     async readQueueStats() {
       return {
@@ -18,6 +22,14 @@ function repositoryReturning(stats: Partial<WatchdogQueueStats>): WatchdogReposi
         deadLetterJobs: 0,
         oldestPendingAt: null,
         ...stats,
+      };
+    },
+    async readCalendarSyncStats() {
+      return {
+        terminalSyncs: 0,
+        urgentUnsynced: 0,
+        staleSyncs: 0,
+        ...calendar,
       };
     },
   };
@@ -134,12 +146,76 @@ describe('HealthWatchdogService', () => {
     expect(report.notified).toBe(false);
   });
 
+  it("avvisa quando un appuntamento futuro non arrivera' mai sul calendario", async () => {
+    const sender = recordingSender();
+    const report = await makeService(repositoryReturning({}, { terminalSyncs: 2 }), sender).check();
+
+    expect(report.status).toBe('critical');
+    expect(report.calendar.terminalSyncs).toBe(2);
+    expect(report.reasons.join(' ')).toContain('esaurito i tentativi');
+    expect(sender.sent[0]?.subject).toContain('Google Calendar');
+    // La copia deve dire all'operatore cosa e\' ancora vero: l'appuntamento
+    // esiste, manca solo la proiezione.
+    expect(sender.sent[0]?.text).toContain('restano validi');
+  });
+
+  it("avvisa al primo fallimento quando l'appuntamento e' entro 24 ore", async () => {
+    const sender = recordingSender();
+    const report = await makeService(
+      repositoryReturning({}, { urgentUnsynced: 1 }),
+      sender,
+    ).check();
+
+    // Sotto le 24 ore non c'e\' piu\' tempo perche\' se ne accorga qualcuno da solo.
+    expect(report.status).toBe('critical');
+    expect(report.reasons.join(' ')).toContain('24 ore');
+  });
+
+  it('rileva il reconciler del calendario fermo', async () => {
+    const sender = recordingSender();
+    const report = await makeService(repositoryReturning({}, { staleSyncs: 5 }), sender).check();
+
+    // Stessa classe di guasto silenzioso per cui il watchdog esiste: il job
+    // non gira e nessuno se ne accorge.
+    expect(report.status).toBe('critical');
+    expect(report.reasons.join(' ')).toContain('non sta girando');
+  });
+
+  it("resta ok quando il calendario e' allineato", async () => {
+    const sender = recordingSender();
+    const report = await makeService(repositoryReturning({}), sender).check();
+
+    expect(report.status).toBe('ok');
+    expect(report.calendar).toEqual({ terminalSyncs: 0, urgentUnsynced: 0, staleSyncs: 0 });
+    expect(sender.sent).toEqual([]);
+  });
+
+  it('usa la finestra di urgenza di 24 ore per il conteggio', async () => {
+    const urgentBefore: Date[] = [];
+    const repository: WatchdogRepository = {
+      async readQueueStats() {
+        return { pendingJobs: 0, staleJobs: 0, deadLetterJobs: 0, oldestPendingAt: null };
+      },
+      async readCalendarSyncStats(input) {
+        urgentBefore.push(input.urgentBefore);
+        return { terminalSyncs: 0, urgentUnsynced: 0, staleSyncs: 0 };
+      },
+    };
+
+    await new HealthWatchdogService(repository, recordingSender(), { now: () => NOW }).check();
+
+    expect(urgentBefore[0]?.toISOString()).toBe('2026-07-28T12:00:00.000Z');
+  });
+
   it('usa la soglia di staleness configurata per calcolare il taglio', async () => {
     let received: Date | null = null;
     const repository: WatchdogRepository = {
       async readQueueStats(input) {
         received = input.staleBefore;
         return { pendingJobs: 0, staleJobs: 0, deadLetterJobs: 0, oldestPendingAt: null };
+      },
+      async readCalendarSyncStats() {
+        return { terminalSyncs: 0, urgentUnsynced: 0, staleSyncs: 0 };
       },
     };
 

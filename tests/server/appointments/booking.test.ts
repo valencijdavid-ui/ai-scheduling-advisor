@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { AppError } from '@/lib/errors/app-error';
 import {
   AppointmentBookingService,
+  LEGACY_MISSING_EVENT_ID_ERROR,
   type AppointmentBookingRepository,
-  type AppointmentCalendarProvider,
   type AppointmentForChange,
   type AppointmentNotificationEnqueuer,
   type AppointmentStatus,
@@ -13,15 +12,23 @@ import {
   type CreatedAppointment,
   type InsertAppointmentInput,
 } from '@/server/appointments/booking';
-import type { CalendarBusyInterval, GoogleCalendarEventResult } from '@/server/calendar/google';
+import { AppError } from '@/lib/errors/app-error';
+import { deriveCalendarEventId } from '@/server/appointments/calendar-convergence';
+import type { CalendarBusyInterval } from '@/server/calendar/google';
+import { FakeGoogleCalendar, googleError } from '../../fixtures/fake-google-calendar';
 
 const now = new Date('2026-04-27T07:00:00.000Z');
+
+const APPOINTMENT_ID = '3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f607';
+const DERIVED_EVENT_ID = deriveCalendarEventId(APPOINTMENT_ID);
+/** Id come lo generava Google prima dell'identita' derivata. */
+const LEGACY_EVENT_ID = '6p1q8rs9tuv0abcd1234567890';
 
 describe('AppointmentBookingService', () => {
   it('returns business-hour slots excluding local and Google busy intervals', async () => {
     const repository = new FakeBookingRepository();
     repository.localBusy = [busy('2026-04-27T09:30:00.000Z', '2026-04-27T10:00:00.000Z')];
-    const calendar = new FakeCalendarProvider([
+    const calendar = new FakeGoogleCalendar([
       busy('2026-04-27T10:30:00.000Z', '2026-04-27T11:00:00.000Z'),
     ]);
     const service = new AppointmentBookingService(
@@ -50,58 +57,43 @@ describe('AppointmentBookingService', () => {
 
   it('creates an appointment, syncs Google Calendar and queues confirmation', async () => {
     const repository = new FakeBookingRepository();
-    const calendar = new FakeCalendarProvider();
+    const calendar = new FakeGoogleCalendar();
     const notifications = new FakeNotificationEnqueuer();
     const service = new AppointmentBookingService(repository, calendar, notifications);
 
     const result = await service.createAppointment({
       tenantId: 'tenant_1',
       serviceId: 'service_1',
-      appointmentId: 'appointment_1',
-      conversationId: 'conversation_1',
+      appointmentId: APPOINTMENT_ID,
       customerIdentifier: '393331112233',
       customerName: 'Mario Rossi',
-      customerPhone: '393331112233',
       scheduledAt: new Date('2026-04-27T09:00:00.000Z'),
       now,
     });
 
     expect(result).toMatchObject({
-      appointmentId: 'appointment_1',
+      appointmentId: APPOINTMENT_ID,
       calendarSyncStatus: 'synced',
-      calendarEventId: 'event_1',
+      calendarEventId: DERIVED_EVENT_ID,
       confirmationQueued: true,
-      confirmationErrorCode: null,
     });
-    expect(repository.insertedAppointments[0]).toMatchObject({
-      id: 'appointment_1',
-      bookingSource: 'whatsapp_ai',
-      calendarProvider: 'google_calendar',
-      calendarSyncStatus: 'pending',
-    });
-    expect(calendar.createdEvents[0]).toMatchObject({
-      appointmentId: 'appointment_1',
-      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
-    });
-    expect(repository.calendarSyncUpdates[0]).toMatchObject({
-      appointmentId: 'appointment_1',
-      status: 'synced',
-      eventId: 'event_1',
-    });
-    expect(notifications.calls[0]).toEqual({
-      tenantId: 'tenant_1',
-      appointmentId: 'appointment_1',
-      kind: 'confirmation',
-      now,
+    expect(calendar.insertCount).toBe(1);
+    expect(repository.row(APPOINTMENT_ID)).toMatchObject({
+      calendarSyncStatus: 'synced',
+      calendarEventId: DERIVED_EVENT_ID,
+      calendarSyncNextAttemptAt: null,
+      calendarSyncError: null,
     });
   });
 
-  it('rejects unavailable appointment slots before inserting', async () => {
+  // Il vincolo di esclusione in Postgres resta l'unica cosa che impedisce due
+  // impegni sovrapposti, e non dipende da Google in nessun modo.
+  it('rejects a conflicting slot before any row is written', async () => {
     const repository = new FakeBookingRepository();
     repository.localBusy = [busy('2026-04-27T09:00:00.000Z', '2026-04-27T09:30:00.000Z')];
     const service = new AppointmentBookingService(
       repository,
-      new FakeCalendarProvider(),
+      new FakeGoogleCalendar(),
       new FakeNotificationEnqueuer(),
     );
 
@@ -121,10 +113,85 @@ describe('AppointmentBookingService', () => {
     expect(repository.insertedAppointments).toHaveLength(0);
   });
 
-  it('marks calendar sync failed and stops confirmation when Google fails', async () => {
+  it('persists the appointment and its calendar identity before calling Google', async () => {
     const repository = new FakeBookingRepository();
-    const calendar = new FakeCalendarProvider();
-    calendar.createError = new AppError('upstream_error', 'Google Calendar event insert failed');
+    const calendar = new FakeGoogleCalendar();
+    // Google e' giu' prima ancora della lettura: nessuna chiamata puo'
+    // riuscire, quindi cio' che resta e' esattamente cio' che l'insert ha
+    // scritto.
+    calendar.getError = googleError(503, 'Service Unavailable');
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    const result = await service.createAppointment({
+      tenantId: 'tenant_1',
+      serviceId: 'service_1',
+      appointmentId: APPOINTMENT_ID,
+      customerIdentifier: '393331112233',
+      customerName: 'Mario Rossi',
+      scheduledAt: new Date('2026-04-27T09:00:00.000Z'),
+      requireCalendarSync: false,
+      now,
+    });
+
+    expect(result.calendarSyncStatus).toBe('failed');
+    // La prenotazione sopravvive al guasto: e' la garanzia che il cliente ha
+    // ricevuto quando gli e' stato detto che l'appuntamento era preso.
+    expect(repository.row(APPOINTMENT_ID)).toBeTruthy();
+
+    const inserted = repository.insertedAppointments[0];
+    expect(inserted).toMatchObject({
+      calendarSyncStatus: 'pending',
+      calendarEventId: DERIVED_EVENT_ID,
+    });
+    // L'identita' e lo stato di recupero sono nello STESSO insert: se il
+    // processo muore qui, lo scanner trova comunque la riga.
+    expect(inserted?.calendarSyncNextAttemptAt).toEqual(now);
+    expect(calendar.insertCount).toBe(0);
+  });
+
+  it('never clears the stored calendar event id when a sync attempt fails', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    // L'evento viene creato davvero su Google e la risposta si perde: e' il
+    // caso che prima azzerava il puntatore e rendeva inevitabile il duplicato.
+    calendar.createThenFail = googleError(504, 'Gateway Timeout');
+
+    await service.createAppointment({
+      tenantId: 'tenant_1',
+      serviceId: 'service_1',
+      appointmentId: APPOINTMENT_ID,
+      customerIdentifier: '393331112233',
+      customerName: 'Mario Rossi',
+      scheduledAt: new Date('2026-04-27T09:00:00.000Z'),
+      requireCalendarSync: false,
+      now,
+    });
+
+    const row = repository.row(APPOINTMENT_ID);
+    expect(row).toMatchObject({
+      calendarSyncStatus: 'failed',
+      calendarEventId: DERIVED_EVENT_ID,
+    });
+    expect(row?.calendarSyncAttempts).toBe(1);
+    // Ogni transizione verso pending/failed lascia una riga recuperabile.
+    expect(row?.calendarSyncNextAttemptAt).not.toBeNull();
+    expect(calendar.insertCount).toBe(1);
+  });
+
+  it('still throws for callers that require calendar sync', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    calendar.getError = googleError(500, 'Backend Error');
     const notifications = new FakeNotificationEnqueuer();
     const service = new AppointmentBookingService(repository, calendar, notifications);
 
@@ -132,34 +199,32 @@ describe('AppointmentBookingService', () => {
       service.createAppointment({
         tenantId: 'tenant_1',
         serviceId: 'service_1',
-        appointmentId: 'appointment_1',
+        appointmentId: APPOINTMENT_ID,
         customerIdentifier: '393331112233',
         customerName: 'Mario Rossi',
         scheduledAt: new Date('2026-04-27T09:00:00.000Z'),
         now,
       }),
-    ).rejects.toMatchObject({
-      code: 'upstream_error',
-    });
-    expect(repository.calendarSyncUpdates[0]).toMatchObject({
-      appointmentId: 'appointment_1',
-      status: 'failed',
-    });
+    ).rejects.toMatchObject({ code: 'upstream_error' });
+
     expect(notifications.calls).toHaveLength(0);
+    // Anche qui la riga resta, e resta riconciliabile.
+    expect(repository.row(APPOINTMENT_ID)?.calendarSyncStatus).toBe('failed');
   });
 
   it('supports tenants without Google Calendar integration', async () => {
-    const repository = new FakeBookingRepository({
-      googleCalendarIntegration: null,
-    });
-    const calendar = new FakeCalendarProvider();
-    const notifications = new FakeNotificationEnqueuer();
-    const service = new AppointmentBookingService(repository, calendar, notifications);
+    const repository = new FakeBookingRepository({ googleCalendarIntegration: null });
+    const calendar = new FakeGoogleCalendar();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
 
     const result = await service.createAppointment({
       tenantId: 'tenant_1',
       serviceId: 'service_1',
-      appointmentId: 'appointment_1',
+      appointmentId: APPOINTMENT_ID,
       customerIdentifier: '393331112233',
       customerName: 'Mario Rossi',
       scheduledAt: new Date('2026-04-27T09:00:00.000Z'),
@@ -171,58 +236,107 @@ describe('AppointmentBookingService', () => {
       calendarEventId: null,
       confirmationQueued: true,
     });
-    expect(calendar.createdEvents).toHaveLength(0);
+    expect(repository.insertedAppointments[0]?.calendarSyncNextAttemptAt).toBeNull();
+    expect(calendar.insertCount).toBe(0);
   });
 
-  it('reschedules an appointment, updates Google Calendar and queues a scoped confirmation', async () => {
+  it('reschedules an appointment, patches Google Calendar and queues a scoped confirmation', async () => {
     const repository = new FakeBookingRepository();
-    repository.appointments.set('appointment_1', appointmentForChange());
-    const calendar = new FakeCalendarProvider();
+    const calendar = new FakeGoogleCalendar();
+    repository.seed(appointmentForChange());
+    calendar.events.set(DERIVED_EVENT_ID, {
+      id: DERIVED_EVENT_ID,
+      status: 'confirmed',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
+      htmlLink: 'https://calendar.google.com/event?eid=x',
+    });
     const notifications = new FakeNotificationEnqueuer();
     const service = new AppointmentBookingService(repository, calendar, notifications);
 
     const result = await service.rescheduleAppointment({
       tenantId: 'tenant_1',
-      appointmentId: 'appointment_1',
+      appointmentId: APPOINTMENT_ID,
       scheduledAt: new Date('2026-04-27T10:00:00.000Z'),
       now,
     });
 
     expect(result).toMatchObject({
-      appointmentId: 'appointment_1',
+      appointmentId: APPOINTMENT_ID,
       status: 'confirmed',
       calendarSyncStatus: 'synced',
+      calendarEventId: DERIVED_EVENT_ID,
       notificationQueued: true,
     });
+    // Postgres per primo: la riga passa da `pending` prima che Google sappia
+    // qualcosa.
     expect(repository.scheduleUpdates[0]).toMatchObject({
-      appointmentId: 'appointment_1',
-      scheduledAt: new Date('2026-04-27T10:00:00.000Z'),
       calendarSyncStatus: 'pending',
     });
-    expect(repository.lastLocalBusyInput).toMatchObject({
-      excludeAppointmentId: 'appointment_1',
-    });
-    expect(calendar.updatedEvents[0]).toMatchObject({
-      eventId: 'event_1',
-      appointmentId: 'appointment_1',
-      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
-    });
+    expect(repository.scheduleUpdates[0]?.calendarSyncNextAttemptAt).toEqual(now);
+    expect(calendar.patchCount).toBe(1);
+    expect(calendar.insertCount).toBe(0);
+    expect(calendar.events.get(DERIVED_EVENT_ID)?.start).toEqual(
+      new Date('2026-04-27T10:00:00.000Z'),
+    );
     expect(notifications.calls[0]).toMatchObject({
       kind: 'confirmation',
       idempotencyScope: 'rescheduled:2026-04-27T10:00:00.000Z',
     });
   });
 
-  it('creates a missing Google Calendar event during reschedule', async () => {
+  it('lets the latest Postgres time win when an earlier create never reached Google', async () => {
     const repository = new FakeBookingRepository();
-    repository.appointments.set(
-      'appointment_1',
+    const calendar = new FakeGoogleCalendar();
+    // La creazione non e' mai arrivata: nessun evento remoto, riga in failed
+    // con la sua identita' intatta.
+    repository.seed(
       appointmentForChange({
-        calendarEventId: null,
+        calendarSyncStatus: 'failed',
         calendarEventHtmlLink: null,
       }),
     );
-    const calendar = new FakeCalendarProvider();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    await service.rescheduleAppointment({
+      tenantId: 'tenant_1',
+      appointmentId: APPOINTMENT_ID,
+      scheduledAt: new Date('2026-04-27T10:00:00.000Z'),
+      now,
+    });
+    await service.rescheduleAppointment({
+      tenantId: 'tenant_1',
+      appointmentId: APPOINTMENT_ID,
+      scheduledAt: new Date('2026-04-27T11:00:00.000Z'),
+      now,
+    });
+
+    // Un solo evento, all'ultimo orario: la convergenza non riesegue la
+    // storia, porta il calendario allo stato attuale.
+    expect(calendar.activeEvents()).toHaveLength(1);
+    expect(calendar.events.get(DERIVED_EVENT_ID)?.start).toEqual(
+      new Date('2026-04-27T11:00:00.000Z'),
+    );
+    expect(repository.row(APPOINTMENT_ID)?.calendarSyncStatus).toBe('synced');
+  });
+
+  it('operates the stored legacy event id instead of deriving a new one', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    repository.seed(appointmentForChange({ calendarEventId: LEGACY_EVENT_ID }));
+    calendar.events.set(LEGACY_EVENT_ID, {
+      id: LEGACY_EVENT_ID,
+      status: 'confirmed',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
+      htmlLink: 'https://calendar.google.com/event?eid=legacy',
+    });
     const service = new AppointmentBookingService(
       repository,
       calendar,
@@ -231,59 +345,231 @@ describe('AppointmentBookingService', () => {
 
     const result = await service.rescheduleAppointment({
       tenantId: 'tenant_1',
-      appointmentId: 'appointment_1',
+      appointmentId: APPOINTMENT_ID,
       scheduledAt: new Date('2026-04-27T10:00:00.000Z'),
       now,
     });
 
-    expect(result).toMatchObject({
-      calendarSyncStatus: 'synced',
-      calendarEventId: 'event_1',
-    });
-    expect(calendar.createdEvents[0]).toMatchObject({
-      appointmentId: 'appointment_1',
-    });
-    expect(calendar.updatedEvents).toHaveLength(0);
+    expect(result.calendarEventId).toBe(LEGACY_EVENT_ID);
+    // Nessun evento nuovo con l'id derivato: sarebbe il doppione.
+    expect(calendar.events.has(DERIVED_EVENT_ID)).toBe(false);
+    expect(calendar.activeEvents()).toHaveLength(1);
+    expect(calendar.events.get(LEGACY_EVENT_ID)?.start).toEqual(
+      new Date('2026-04-27T10:00:00.000Z'),
+    );
   });
 
-  it('cancels an appointment, deletes Google Calendar event and queues cancellation', async () => {
+  it('refuses to invent an event for a legacy row that has no stored identity', async () => {
     const repository = new FakeBookingRepository();
-    repository.appointments.set('appointment_1', appointmentForChange());
-    const calendar = new FakeCalendarProvider();
+    const calendar = new FakeGoogleCalendar();
+    repository.seed(appointmentForChange({ calendarEventId: null, calendarEventHtmlLink: null }));
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    const result = await service.rescheduleAppointment({
+      tenantId: 'tenant_1',
+      appointmentId: APPOINTMENT_ID,
+      scheduledAt: new Date('2026-04-27T10:00:00.000Z'),
+      requireCalendarSync: false,
+      now,
+    });
+
+    expect(result.calendarSyncStatus).toBe('failed');
+    // Nessuna scrittura su Google: potrebbe esistere gia' un evento che non
+    // sappiamo indirizzare, e crearne un altro sarebbe il duplicato.
+    expect(calendar.insertCount).toBe(0);
+    expect(calendar.patchCount).toBe(0);
+
+    const row = repository.row(APPOINTMENT_ID);
+    expect(row?.calendarSyncError).toBe(LEGACY_MISSING_EVENT_ID_ERROR);
+    // Terminale per predicato: passa all'operatore, non al retry automatico.
+    expect(row?.calendarSyncAttempts).toBeGreaterThanOrEqual(5);
+    // Lo spostamento in Postgres e' comunque avvenuto.
+    expect(row?.scheduledAt).toEqual(new Date('2026-04-27T10:00:00.000Z'));
+  });
+
+  it('cancels the appointment in Postgres before touching Google', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    repository.seed(appointmentForChange());
+    calendar.events.set(DERIVED_EVENT_ID, {
+      id: DERIVED_EVENT_ID,
+      status: 'confirmed',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
+      htmlLink: 'https://calendar.google.com/event?eid=x',
+    });
     const notifications = new FakeNotificationEnqueuer();
+    calendar.trace = repository.writeOrder;
     const service = new AppointmentBookingService(repository, calendar, notifications);
 
     const result = await service.cancelAppointment({
       tenantId: 'tenant_1',
-      appointmentId: 'appointment_1',
+      appointmentId: APPOINTMENT_ID,
       now,
     });
 
     expect(result).toMatchObject({
-      appointmentId: 'appointment_1',
       status: 'cancelled',
       calendarSyncStatus: 'synced',
       notificationQueued: true,
     });
-    expect(calendar.cancelledEvents[0]).toEqual({
-      integration: repository.context.googleCalendarIntegration,
-      eventId: 'event_1',
+    // L'ordine e' la correzione centrale: la riga e' gia' `cancelled` e
+    // `pending` prima che parta la DELETE.
+    expect(repository.writeOrder).toEqual(['cancel-record', 'google', 'settle']);
+    expect(repository.cancelUpdates[0]).toMatchObject({ calendarSyncStatus: 'pending' });
+    expect(repository.cancelUpdates[0]?.calendarSyncNextAttemptAt).toEqual(now);
+    expect(calendar.activeEvents()).toHaveLength(0);
+    expect(notifications.calls[0]).toMatchObject({ kind: 'cancellation' });
+  });
+
+  it('keeps a failed cancellation retryable instead of losing the Google event', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    repository.seed(appointmentForChange());
+    calendar.events.set(DERIVED_EVENT_ID, {
+      id: DERIVED_EVENT_ID,
+      status: 'confirmed',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
+      htmlLink: 'https://calendar.google.com/event?eid=x',
     });
-    expect(repository.cancelUpdates[0]).toMatchObject({
-      appointmentId: 'appointment_1',
-      calendarSyncStatus: 'synced',
+    calendar.cancelError = googleError(503, 'Service Unavailable');
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    const result = await service.cancelAppointment({
+      tenantId: 'tenant_1',
+      appointmentId: APPOINTMENT_ID,
+      requireCalendarSync: false,
+      now,
     });
-    expect(notifications.calls[0]).toMatchObject({
-      kind: 'cancellation',
+
+    expect(result.calendarSyncStatus).toBe('failed');
+
+    const row = repository.row(APPOINTMENT_ID);
+    // L'annullamento e' definitivo lato prodotto...
+    expect(row?.status).toBe('cancelled');
+    // ...e la rimozione dell'evento resta dovuta: senza, l'evento fantasma
+    // continuerebbe a occupare lo slot nel calcolo della disponibilita'.
+    expect(row?.calendarSyncStatus).toBe('failed');
+    expect(row?.calendarEventId).toBe(DERIVED_EVENT_ID);
+    expect(row?.calendarSyncNextAttemptAt).not.toBeNull();
+    expect(row?.calendarSyncAttempts).toBe(1);
+  });
+
+  it('reports a successful cancellation even when the caller required calendar sync', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    repository.seed(appointmentForChange());
+    calendar.events.set(DERIVED_EVENT_ID, {
+      id: DERIVED_EVENT_ID,
+      status: 'confirmed',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
+      htmlLink: 'https://calendar.google.com/event?eid=x',
     });
+    calendar.cancelError = googleError(503, 'Service Unavailable');
+    const notifications = new FakeNotificationEnqueuer();
+    const service = new AppointmentBookingService(repository, calendar, notifications);
+
+    // `requireCalendarSync` di default e' true: prima questo percorso sollevava
+    // DOPO che la cancellazione autorevole era gia' committata, dicendo al
+    // chiamante che l'operazione non era avvenuta quando invece era definitiva.
+    const result = await service.cancelAppointment({
+      tenantId: 'tenant_1',
+      appointmentId: APPOINTMENT_ID,
+      requireCalendarSync: true,
+      now,
+    });
+
+    expect(result.status).toBe('cancelled');
+    expect(result.calendarSyncStatus).toBe('failed');
+    // La notifica al cliente parte: l'annullamento e' reale.
+    expect(result.notificationQueued).toBe(true);
+    expect(notifications.calls[0]).toMatchObject({ kind: 'cancellation' });
+
+    const row = repository.row(APPOINTMENT_ID);
+    expect(row?.status).toBe('cancelled');
+    // Google resta da riparare, e resta riparabile.
+    expect(row?.calendarSyncStatus).toBe('failed');
+    expect(row?.calendarEventId).toBe(DERIVED_EVENT_ID);
+    expect(row?.calendarSyncNextAttemptAt).not.toBeNull();
+    expect(row?.calendarSyncAttempts).toBeLessThan(5);
+  });
+
+  it('stops a reschedule whose guarded update lost the race to a cancellation', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    repository.seed(appointmentForChange());
+    // L'annullamento concorrente ha gia' rimosso l'evento da Google.
+    repository.beforeScheduleUpdate = async () => {
+      const existing = repository.row(APPOINTMENT_ID);
+
+      if (existing) {
+        repository.rows.set(APPOINTMENT_ID, { ...existing, status: 'cancelled' });
+      }
+    };
+    const notifications = new FakeNotificationEnqueuer();
+    const service = new AppointmentBookingService(repository, calendar, notifications);
+
+    await expect(
+      service.rescheduleAppointment({
+        tenantId: 'tenant_1',
+        appointmentId: APPOINTMENT_ID,
+        scheduledAt: new Date('2026-04-27T10:00:00.000Z'),
+        requireCalendarSync: false,
+        now,
+      }),
+    ).rejects.toMatchObject({ code: 'conflict' });
+
+    // Il punto della correzione: senza il rilevamento delle zero righe, la
+    // riprogrammazione sarebbe proseguita, la convergenza avrebbe trovato
+    // l'evento assente e lo avrebbe RICREATO per un appuntamento annullato.
+    expect(calendar.insertCount).toBe(0);
+    expect(calendar.patchCount).toBe(0);
+    expect(calendar.getCount).toBe(0);
+    expect(calendar.activeEvents()).toHaveLength(0);
+
+    const row = repository.row(APPOINTMENT_ID);
+    expect(row?.status).toBe('cancelled');
+    // Nessuna scrittura di esito: la riga non e' stata marcata sincronizzata,
+    // quindi non e' stata sottratta al reconciler.
+    expect(repository.calendarSyncUpdates).toHaveLength(0);
+    expect(notifications.calls).toHaveLength(0);
   });
 });
 
+type StoredAppointment = AppointmentForChange & {
+  calendarSyncError: string | null;
+  calendarSyncAttempts: number;
+  calendarSyncNextAttemptAt: Date | null;
+  calendarSyncLastAttemptAt: Date | null;
+};
+
+/**
+ * Repository in memoria che applica le patch come le applica il SQL reale.
+ *
+ * Le asserzioni interessanti riguardano cio' che RESTA nella riga dopo una
+ * sequenza di scritture — per esempio che un fallimento non azzeri
+ * `calendar_event_id` — e su un fake che si limitasse a registrare le
+ * chiamate non sarebbero verificabili.
+ */
 class FakeBookingRepository implements AppointmentBookingRepository {
   readonly context: BookingServiceContext;
   localBusy: CalendarBusyInterval[] = [];
   insertedAppointments: InsertAppointmentInput[] = [];
-  appointments = new Map<string, AppointmentForChange>();
+  readonly rows = new Map<string, StoredAppointment>();
+  readonly writeOrder: string[] = [];
   lastLocalBusyInput: {
     tenantId: string;
     from: Date;
@@ -293,24 +579,23 @@ class FakeBookingRepository implements AppointmentBookingRepository {
   calendarSyncUpdates: Array<{
     appointmentId: string;
     status: CalendarSyncStatus;
-    eventId?: string | null;
-    htmlLink?: string | null;
-    errorMessage?: string | null;
+    eventId?: string;
+    attempts: number;
+    nextAttemptAt: Date | null;
   }> = [];
   scheduleUpdates: Array<{
-    tenantId: string;
     appointmentId: string;
     scheduledAt: Date;
-    durationMinutes: number;
-    notes: string | null;
     calendarSyncStatus: CalendarSyncStatus;
+    calendarSyncNextAttemptAt: Date | null;
   }> = [];
   cancelUpdates: Array<{
-    tenantId: string;
     appointmentId: string;
     calendarSyncStatus: CalendarSyncStatus;
-    errorMessage?: string | null;
+    calendarSyncNextAttemptAt: Date | null;
   }> = [];
+  /** Innesto per simulare una scrittura concorrente a meta' riprogrammazione. */
+  beforeScheduleUpdate: (() => Promise<void>) | null = null;
 
   constructor(overrides: Partial<BookingServiceContext> = {}) {
     this.context = {
@@ -328,13 +613,7 @@ class FakeBookingRepository implements AppointmentBookingRepository {
         durationMinutes: 30,
         active: true,
       },
-      businessHours: [
-        {
-          weekday: 1,
-          opensAt: '09:00:00',
-          closesAt: '12:00:00',
-        },
-      ],
+      businessHours: [{ weekday: 1, opensAt: '09:00:00', closesAt: '12:00:00' }],
       googleCalendarIntegration: {
         id: 'integration_1',
         tenantId: 'tenant_1',
@@ -344,6 +623,20 @@ class FakeBookingRepository implements AppointmentBookingRepository {
       },
       ...overrides,
     };
+  }
+
+  seed(appointment: AppointmentForChange): void {
+    this.rows.set(appointment.id, {
+      ...appointment,
+      calendarSyncError: null,
+      calendarSyncAttempts: 0,
+      calendarSyncNextAttemptAt: null,
+      calendarSyncLastAttemptAt: null,
+    });
+  }
+
+  row(appointmentId: string): StoredAppointment | undefined {
+    return this.rows.get(appointmentId);
   }
 
   async getBookingContext(): Promise<BookingServiceContext | null> {
@@ -362,6 +655,29 @@ class FakeBookingRepository implements AppointmentBookingRepository {
 
   async insertAppointment(input: InsertAppointmentInput): Promise<CreatedAppointment> {
     this.insertedAppointments.push(input);
+    this.writeOrder.push('insert');
+    this.rows.set(input.id, {
+      id: input.id,
+      tenantId: input.tenantId,
+      conversationId: input.conversationId,
+      serviceId: input.serviceId,
+      serviceName: input.serviceName,
+      customerIdentifier: input.customerIdentifier,
+      customerName: input.customerName,
+      customerPhone: input.customerPhone,
+      scheduledAt: input.scheduledAt,
+      durationMinutes: input.durationMinutes,
+      status: 'confirmed',
+      calendarProvider: input.calendarProvider,
+      calendarSyncStatus: input.calendarSyncStatus,
+      calendarEventId: input.calendarEventId,
+      calendarEventHtmlLink: null,
+      notes: input.notes,
+      calendarSyncError: null,
+      calendarSyncAttempts: 0,
+      calendarSyncNextAttemptAt: input.calendarSyncNextAttemptAt,
+      calendarSyncLastAttemptAt: null,
+    });
 
     return {
       id: input.id,
@@ -369,7 +685,7 @@ class FakeBookingRepository implements AppointmentBookingRepository {
       scheduledAt: input.scheduledAt,
       durationMinutes: input.durationMinutes,
       calendarSyncStatus: input.calendarSyncStatus,
-      calendarEventId: null,
+      calendarEventId: input.calendarEventId,
       calendarEventHtmlLink: null,
     };
   }
@@ -378,11 +694,40 @@ class FakeBookingRepository implements AppointmentBookingRepository {
     tenantId: string;
     appointmentId: string;
     status: CalendarSyncStatus;
-    eventId?: string | null;
+    eventId?: string;
     htmlLink?: string | null;
-    errorMessage?: string | null;
+    errorMessage: string | null;
+    attempts: number;
+    nextAttemptAt: Date | null;
+    lastAttemptAt: Date;
   }): Promise<void> {
-    this.calendarSyncUpdates.push(input);
+    this.writeOrder.push('settle');
+    this.calendarSyncUpdates.push({
+      appointmentId: input.appointmentId,
+      status: input.status,
+      ...(input.eventId !== undefined ? { eventId: input.eventId } : {}),
+      attempts: input.attempts,
+      nextAttemptAt: input.nextAttemptAt,
+    });
+
+    const existing = this.rows.get(input.appointmentId);
+
+    if (!existing) {
+      return;
+    }
+
+    this.rows.set(input.appointmentId, {
+      ...existing,
+      calendarSyncStatus: input.status,
+      calendarSyncError: input.errorMessage,
+      calendarSyncAttempts: input.attempts,
+      calendarSyncNextAttemptAt: input.nextAttemptAt,
+      calendarSyncLastAttemptAt: input.lastAttemptAt,
+      // Le due colonne dell'identita' entrano nella patch solo se passate:
+      // e' la regola che impedisce a un fallimento di cancellarle.
+      ...(input.eventId !== undefined ? { calendarEventId: input.eventId } : {}),
+      ...(input.htmlLink !== undefined ? { calendarEventHtmlLink: input.htmlLink } : {}),
+    });
   }
 
   async updateGoogleCalendarAccessToken(): Promise<void> {}
@@ -390,7 +735,7 @@ class FakeBookingRepository implements AppointmentBookingRepository {
   async getAppointmentForChange(input: {
     appointmentId: string;
   }): Promise<AppointmentForChange | null> {
-    return this.appointments.get(input.appointmentId) ?? null;
+    return this.rows.get(input.appointmentId) ?? null;
   }
 
   async updateAppointmentSchedule(input: {
@@ -399,18 +744,40 @@ class FakeBookingRepository implements AppointmentBookingRepository {
     scheduledAt: Date;
     durationMinutes: number;
     notes: string | null;
+    calendarProvider: 'google_calendar' | null;
     calendarSyncStatus: CalendarSyncStatus;
+    calendarSyncNextAttemptAt: Date | null;
   }): Promise<void> {
-    this.scheduleUpdates.push(input);
-    const existing = this.appointments.get(input.appointmentId);
+    // Punto di innesto della corsa: il test annulla l'appuntamento qui, cioe'
+    // esattamente fra la lettura e la scrittura guardata.
+    await this.beforeScheduleUpdate?.();
 
-    if (existing) {
-      this.appointments.set(input.appointmentId, {
+    this.writeOrder.push('schedule');
+    this.scheduleUpdates.push({
+      appointmentId: input.appointmentId,
+      scheduledAt: input.scheduledAt,
+      calendarSyncStatus: input.calendarSyncStatus,
+      calendarSyncNextAttemptAt: input.calendarSyncNextAttemptAt,
+    });
+
+    const existing = this.rows.get(input.appointmentId);
+
+    // Stesso filtro del SQL reale (`.eq('status','confirmed')`) e stessa
+    // reazione a zero righe aggiornate.
+    if (!existing || existing.status !== 'confirmed') {
+      throw new AppError('conflict', 'Appointment is no longer confirmed', { expose: false });
+    }
+
+    {
+      this.rows.set(input.appointmentId, {
         ...existing,
         scheduledAt: input.scheduledAt,
         durationMinutes: input.durationMinutes,
         notes: input.notes,
         calendarSyncStatus: input.calendarSyncStatus,
+        calendarSyncError: null,
+        calendarSyncAttempts: 0,
+        calendarSyncNextAttemptAt: input.calendarSyncNextAttemptAt,
       });
     }
   }
@@ -419,90 +786,27 @@ class FakeBookingRepository implements AppointmentBookingRepository {
     tenantId: string;
     appointmentId: string;
     calendarSyncStatus: CalendarSyncStatus;
-    errorMessage?: string | null;
+    calendarSyncNextAttemptAt: Date | null;
   }): Promise<void> {
-    this.cancelUpdates.push(input);
-    const existing = this.appointments.get(input.appointmentId);
+    this.writeOrder.push('cancel-record');
+    this.cancelUpdates.push({
+      appointmentId: input.appointmentId,
+      calendarSyncStatus: input.calendarSyncStatus,
+      calendarSyncNextAttemptAt: input.calendarSyncNextAttemptAt,
+    });
+
+    const existing = this.rows.get(input.appointmentId);
 
     if (existing) {
-      this.appointments.set(input.appointmentId, {
+      this.rows.set(input.appointmentId, {
         ...existing,
         status: 'cancelled',
         calendarSyncStatus: input.calendarSyncStatus,
+        calendarSyncError: null,
+        calendarSyncAttempts: 0,
+        calendarSyncNextAttemptAt: input.calendarSyncNextAttemptAt,
       });
     }
-  }
-}
-
-class FakeCalendarProvider implements AppointmentCalendarProvider {
-  readonly createdEvents: Array<{
-    appointmentId: string;
-    summary: string;
-  }> = [];
-  readonly updatedEvents: Array<{
-    eventId: string;
-    appointmentId: string;
-    summary: string;
-  }> = [];
-  readonly cancelledEvents: Array<{
-    integration: unknown;
-    eventId: string;
-  }> = [];
-  createError: Error | null = null;
-  updateError: Error | null = null;
-  cancelError: Error | null = null;
-
-  constructor(private readonly busyIntervals: CalendarBusyInterval[] = []) {}
-
-  async listBusy(): Promise<CalendarBusyInterval[]> {
-    return this.busyIntervals;
-  }
-
-  async createEvent(input: {
-    appointmentId: string;
-    summary: string;
-  }): Promise<GoogleCalendarEventResult> {
-    if (this.createError) {
-      throw this.createError;
-    }
-
-    this.createdEvents.push(input);
-
-    return {
-      eventId: 'event_1',
-      htmlLink: 'https://calendar.google.com/event?eid=event_1',
-      raw: {},
-    };
-  }
-
-  async updateEvent(input: {
-    eventId: string;
-    appointmentId: string;
-    summary: string;
-  }): Promise<GoogleCalendarEventResult> {
-    if (this.updateError) {
-      throw this.updateError;
-    }
-
-    this.updatedEvents.push(input);
-
-    return {
-      eventId: input.eventId,
-      htmlLink: 'https://calendar.google.com/event?eid=event_1',
-      raw: {},
-    };
-  }
-
-  async cancelEvent(input: {
-    integration: unknown;
-    eventId: string;
-  }): Promise<{ cancelled: true }> {
-    if (this.cancelError) {
-      throw this.cancelError;
-    }
-
-    this.cancelledEvents.push(input);
-    return { cancelled: true };
   }
 }
 
@@ -537,7 +841,7 @@ function busy(start: string, end: string): CalendarBusyInterval {
 
 function appointmentForChange(overrides: Partial<AppointmentForChange> = {}): AppointmentForChange {
   return {
-    id: 'appointment_1',
+    id: APPOINTMENT_ID,
     tenantId: 'tenant_1',
     conversationId: 'conversation_1',
     serviceId: 'service_1',
@@ -550,8 +854,8 @@ function appointmentForChange(overrides: Partial<AppointmentForChange> = {}): Ap
     status: 'confirmed' as AppointmentStatus,
     calendarProvider: 'google_calendar',
     calendarSyncStatus: 'synced',
-    calendarEventId: 'event_1',
-    calendarEventHtmlLink: 'https://calendar.google.com/event?eid=event_1',
+    calendarEventId: DERIVED_EVENT_ID,
+    calendarEventHtmlLink: 'https://calendar.google.com/event?eid=x',
     notes: null,
     ...overrides,
   };

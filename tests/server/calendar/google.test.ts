@@ -98,6 +98,102 @@ describe('GoogleCalendarProvider', () => {
     });
   });
 
+  it('sends the caller-supplied id so a repeated insert is a conflict, not a duplicate', async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse({ id: 'apt00000000000000000000000000000001' }),
+    );
+    const provider = new GoogleCalendarProvider({ fetcher });
+
+    await provider.createEvent({
+      integration: integration(),
+      eventId: 'apt00000000000000000000000000000001',
+      appointmentId: '00000000-0000-4000-8000-000000000001',
+      tenantId: 'tenant_1',
+      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+      timezone: 'UTC',
+      customerName: 'Mario Rossi',
+    });
+
+    const body = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
+    expect(body.id).toBe('apt00000000000000000000000000000001');
+  });
+
+  it('reads an event by id and reports its status and times', async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse({
+        id: 'apt_1',
+        htmlLink: 'https://calendar.google.com/event?eid=apt_1',
+        status: 'confirmed',
+        start: { dateTime: '2026-04-27T11:00:00+02:00' },
+        end: { dateTime: '2026-04-27T11:30:00+02:00' },
+      }),
+    );
+    const provider = new GoogleCalendarProvider({ fetcher });
+
+    const snapshot = await provider.getEvent({ integration: integration(), eventId: 'apt_1' });
+
+    expect(String(fetcher.mock.calls[0]?.[0])).toContain('/calendars/primary/events/apt_1');
+    expect(fetcher.mock.calls[0]?.[1]?.method).toBe('GET');
+    expect(snapshot).toMatchObject({
+      eventId: 'apt_1',
+      status: 'confirmed',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+    });
+  });
+
+  it('returns null for a missing event instead of raising', async () => {
+    // Per la convergenza "non esiste" e' un esito normale: e' cio' che
+    // autorizza la creazione.
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse({ error: { code: 404 } }, { status: 404 }),
+    );
+    const provider = new GoogleCalendarProvider({ fetcher });
+
+    await expect(
+      provider.getEvent({ integration: integration(), eventId: 'apt_1' }),
+    ).resolves.toBeNull();
+  });
+
+  it('surfaces the HTTP status of a failed read so retries can be classified', async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse({ error: { code: 401 } }, { status: 401 }),
+    );
+    const provider = new GoogleCalendarProvider({ fetcher });
+
+    await expect(
+      provider.getEvent({ integration: integration(), eventId: 'apt_1' }),
+    ).rejects.toMatchObject({
+      code: 'upstream_error',
+      cause: { status: 401 },
+    });
+  });
+
+  it('can force a hand-deleted event back to confirmed', async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse({ id: 'apt_1' }),
+    );
+    const provider = new GoogleCalendarProvider({ fetcher });
+
+    await provider.updateEvent({
+      integration: integration(),
+      eventId: 'apt_1',
+      status: 'confirmed',
+      appointmentId: '00000000-0000-4000-8000-000000000001',
+      tenantId: 'tenant_1',
+      summary: 'Studio Ambrogio: Prima visita - Mario Rossi',
+      start: new Date('2026-04-27T09:00:00.000Z'),
+      end: new Date('2026-04-27T09:30:00.000Z'),
+      timezone: 'UTC',
+      customerName: 'Mario Rossi',
+    });
+
+    const body = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
+    expect(body.status).toBe('confirmed');
+  });
+
   it('updates Google Calendar events for reschedules', async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       jsonResponse({

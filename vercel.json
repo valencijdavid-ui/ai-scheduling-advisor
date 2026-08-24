@@ -19,6 +19,10 @@
       "schedule": "*/5 * * * *"
     },
     {
+      "path": "/api/internal/jobs/calendar-sync",
+      "schedule": "*/5 * * * *"
+    },
+    {
       "path": "/api/internal/jobs/gdpr-hard-delete",
       "schedule": "0 3 * * *"
     },

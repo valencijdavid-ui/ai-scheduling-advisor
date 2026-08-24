@@ -2,6 +2,10 @@ import { createSupabaseAdminClient } from '@/lib/supabase/admin';
 import { env } from '@/lib/env';
 import { AppError } from '@/lib/errors/app-error';
 import { logger } from '@/lib/logging/logger';
+import {
+  CALENDAR_SYNC_MAX_ATTEMPTS,
+  CALENDAR_SYNC_URGENT_WINDOW_MS,
+} from '@/server/appointments/calendar-convergence';
 import { createEmailSender, type EmailSender } from '@/server/notifications/mailer';
 
 /**
@@ -24,7 +28,31 @@ const DEFAULT_STALE_AFTER_MINUTES = 15;
 /** Oltre questa soglia la coda è considerata in accumulo anche se recente. */
 const DEFAULT_BACKLOG_THRESHOLD = 100;
 
+/**
+ * Una riga dovuta da più di questo tempo indica che il reconciler del
+ * calendario non sta girando.
+ *
+ * Il cron gira ogni 5 minuti: mezz'ora sono sei tick mancati, non un ritardo.
+ */
+const DEFAULT_CALENDAR_STALE_AFTER_MINUTES = 30;
+
 export type WatchdogStatus = 'ok' | 'warning' | 'critical';
+
+/**
+ * Segnali sulla proiezione Google Calendar.
+ *
+ * Sono contati solo sugli appuntamenti FUTURI: un appuntamento passato non
+ * sincronizzato non richiede nessuna azione, e includerlo trasformerebbe
+ * l'allarme in rumore permanente.
+ */
+export interface WatchdogCalendarStats {
+  /** Righe che hanno esaurito i tentativi: serve un intervento umano. */
+  terminalSyncs: number;
+  /** Appuntamenti entro 24h già falliti almeno una volta. */
+  urgentUnsynced: number;
+  /** Righe dovute da troppo tempo: il reconciler stesso non sta girando. */
+  staleSyncs: number;
+}
 
 export interface WatchdogReport {
   readonly status: WatchdogStatus;
@@ -36,6 +64,7 @@ export interface WatchdogReport {
   /** Job che hanno esaurito i tentativi. */
   readonly deadLetterJobs: number;
   readonly oldestPendingMinutes: number | null;
+  readonly calendar: WatchdogCalendarStats;
   readonly reasons: readonly string[];
   readonly notified: boolean;
 }
@@ -49,10 +78,16 @@ export interface WatchdogQueueStats {
 
 export interface WatchdogRepository {
   readQueueStats(input: { staleBefore: Date }): Promise<WatchdogQueueStats>;
+  readCalendarSyncStats(input: {
+    now: Date;
+    urgentBefore: Date;
+    staleBefore: Date;
+  }): Promise<WatchdogCalendarStats>;
 }
 
 export interface WatchdogOptions {
   readonly staleAfterMinutes?: number;
+  readonly calendarStaleAfterMinutes?: number;
   readonly backlogThreshold?: number;
   /** Indirizzo a cui inviare l'allarme. Senza, il watchdog osserva e basta. */
   readonly alertEmail?: string;
@@ -71,8 +106,16 @@ export class HealthWatchdogService {
     const staleAfterMinutes = this.options.staleAfterMinutes ?? DEFAULT_STALE_AFTER_MINUTES;
     const backlogThreshold = this.options.backlogThreshold ?? DEFAULT_BACKLOG_THRESHOLD;
 
+    const calendarStaleAfterMinutes =
+      this.options.calendarStaleAfterMinutes ?? DEFAULT_CALENDAR_STALE_AFTER_MINUTES;
+
     const staleBefore = new Date(now.getTime() - staleAfterMinutes * 60_000);
     const stats = await this.repository.readQueueStats({ staleBefore });
+    const calendar = await this.repository.readCalendarSyncStats({
+      now,
+      urgentBefore: new Date(now.getTime() + CALENDAR_SYNC_URGENT_WINDOW_MS),
+      staleBefore: new Date(now.getTime() - calendarStaleAfterMinutes * 60_000),
+    });
 
     const oldestPendingMinutes =
       stats.oldestPendingAt === null
@@ -104,6 +147,31 @@ export class HealthWatchdogService {
       );
     }
 
+    // I tre segnali sul calendario sono tutti `critical` e non è una svista.
+    // Un appuntamento preso con il cliente e assente dal calendario dello
+    // studio è un impegno che nessuno vedrà arrivare: non esiste una versione
+    // "da guardare con calma" di questo problema.
+    if (calendar.terminalSyncs > 0) {
+      status = 'critical';
+      reasons.push(
+        `${calendar.terminalSyncs} appuntamenti futuri non sono sul calendario Google e hanno esaurito i tentativi: vanno inseriti a mano o va ricollegato Google.`,
+      );
+    }
+
+    if (calendar.urgentUnsynced > 0) {
+      status = 'critical';
+      reasons.push(
+        `${calendar.urgentUnsynced} appuntamenti entro 24 ore non risultano ancora sul calendario Google.`,
+      );
+    }
+
+    if (calendar.staleSyncs > 0) {
+      status = 'critical';
+      reasons.push(
+        `${calendar.staleSyncs} sincronizzazioni sono in attesa da oltre ${calendarStaleAfterMinutes} minuti: il job di riconciliazione del calendario non sta girando.`,
+      );
+    }
+
     const report: WatchdogReport = {
       status,
       checkedAt: now.toISOString(),
@@ -111,12 +179,16 @@ export class HealthWatchdogService {
       staleJobs: stats.staleJobs,
       deadLetterJobs: stats.deadLetterJobs,
       oldestPendingMinutes,
+      calendar,
       reasons,
       notified: false,
     };
 
     if (status === 'ok') {
-      logger.info({ pendingJobs: stats.pendingJobs }, 'Watchdog: coda in salute');
+      logger.info(
+        { pendingJobs: stats.pendingJobs, calendarTerminalSyncs: calendar.terminalSyncs },
+        'Watchdog: coda in salute',
+      );
       return report;
     }
 
@@ -127,6 +199,9 @@ export class HealthWatchdogService {
         staleJobs: stats.staleJobs,
         deadLetterJobs: stats.deadLetterJobs,
         oldestPendingMinutes,
+        calendarTerminalSyncs: calendar.terminalSyncs,
+        calendarUrgentUnsynced: calendar.urgentUnsynced,
+        calendarStaleSyncs: calendar.staleSyncs,
       },
       'Watchdog: coda in stato anomalo',
     );
@@ -145,8 +220,13 @@ export class HealthWatchdogService {
     const recipient = this.options.alertEmail;
     if (!recipient) return false;
 
-    const subject =
-      report.status === 'critical'
+    const calendarAffected =
+      report.calendar.terminalSyncs > 0 ||
+      report.calendar.urgentUnsynced > 0 ||
+      report.calendar.staleSyncs > 0;
+    const subject = calendarAffected
+      ? '[Ambrogio] Appuntamenti non sincronizzati con Google Calendar'
+      : report.status === 'critical'
         ? '[Ambrogio] I messaggi WhatsApp non stanno uscendo'
         : '[Ambrogio] La coda messaggi richiede attenzione';
 
@@ -164,10 +244,20 @@ export class HealthWatchdogService {
         ? ''
         : `Messaggio più vecchio in coda: ${report.oldestPendingMinutes} minuti fa`,
       '',
+      calendarAffected ? 'Google Calendar:' : '',
+      calendarAffected ? `Da inserire a mano: ${report.calendar.terminalSyncs}` : '',
+      calendarAffected ? `Entro 24 ore, non sincronizzati: ${report.calendar.urgentUnsynced}` : '',
+      calendarAffected ? `In attesa da troppo tempo: ${report.calendar.staleSyncs}` : '',
+      '',
       `Rilevazione: ${report.checkedAt}`,
       '',
+      'Gli appuntamenti restano validi e visibili nella dashboard: manca solo la',
+      'copia sul calendario Google. Il runbook con le query è in',
+      'docs/runbook-calendar-sync.md.',
+      '',
       'Prima cosa da verificare: che i cron della piattaforma stiano effettivamente',
-      'invocando /api/internal/jobs/whatsapp-outbox e che rispondano 200.',
+      'invocando /api/internal/jobs/whatsapp-outbox e',
+      '/api/internal/jobs/calendar-sync, e che rispondano 200.',
     ]
       .filter((line) => line !== '')
       .join('\n');
@@ -227,6 +317,62 @@ class SupabaseWatchdogRepository implements WatchdogRepository {
       deadLetterJobs: deadLetter.count ?? 0,
       oldestPendingAt:
         (oldest.data as { next_attempt_at?: string } | null)?.next_attempt_at ?? null,
+    };
+  }
+
+  /**
+   * Tre conteggi sulla stessa tabella degli appuntamenti.
+   *
+   * `terminalSyncs` usa il predicato di terminalità nella sua forma piena
+   * (`failed` e tentativi esauriti) ristretto al futuro: la seconda metà del
+   * predicato — `scheduled_at <= now()` — descrive righe su cui non c'è più
+   * niente da fare, e allarmarci sopra sarebbe rumore.
+   */
+  async readCalendarSyncStats(input: {
+    now: Date;
+    urgentBefore: Date;
+    staleBefore: Date;
+  }): Promise<WatchdogCalendarStats> {
+    const nowIso = input.now.toISOString();
+    const waiting = ['pending', 'failed'];
+
+    const [terminal, urgent, stale] = await Promise.all([
+      this.supabase
+        .from('appointments')
+        .select('id', { count: 'exact', head: true })
+        .eq('calendar_provider', 'google_calendar')
+        .eq('calendar_sync_status', 'failed')
+        .gte('calendar_sync_attempts', CALENDAR_SYNC_MAX_ATTEMPTS)
+        .gt('scheduled_at', nowIso),
+      this.supabase
+        .from('appointments')
+        .select('id', { count: 'exact', head: true })
+        .eq('calendar_provider', 'google_calendar')
+        .in('calendar_sync_status', waiting)
+        .gte('calendar_sync_attempts', 1)
+        .gt('scheduled_at', nowIso)
+        .lte('scheduled_at', input.urgentBefore.toISOString()),
+      this.supabase
+        .from('appointments')
+        .select('id', { count: 'exact', head: true })
+        .eq('calendar_provider', 'google_calendar')
+        .in('calendar_sync_status', waiting)
+        .not('calendar_sync_next_attempt_at', 'is', null)
+        .lt('calendar_sync_next_attempt_at', input.staleBefore.toISOString())
+        .lt('calendar_sync_attempts', CALENDAR_SYNC_MAX_ATTEMPTS)
+        .gt('scheduled_at', nowIso),
+    ]);
+
+    const failure = terminal.error ?? urgent.error ?? stale.error;
+
+    if (failure) {
+      throw new AppError('internal', 'Failed to read calendar sync stats', { cause: failure });
+    }
+
+    return {
+      terminalSyncs: terminal.count ?? 0,
+      urgentUnsynced: urgent.count ?? 0,
+      staleSyncs: stale.count ?? 0,
     };
   }
 }
