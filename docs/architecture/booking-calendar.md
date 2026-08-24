@@ -106,10 +106,26 @@ Regole applicate:
 `cancelAppointment()`:
 
 1. legge l'appuntamento confermato;
-2. se Google Calendar e' configurato e l'evento esiste, chiama `events.delete`;
-3. marca l'appuntamento `status='cancelled'`;
-4. salva lo stato sync calendar;
+2. marca l'appuntamento `status='cancelled'` con stato sync ritentabile
+   (`pending` + `calendar_sync_next_attempt_at`);
+3. solo dopo, converge Google (`events.delete`, con 404/410 gia' trattati come
+   successo);
+4. salva l'esito della convergenza;
 5. accoda notifica WhatsApp `appointment_cancellation`.
+
+L'ordine e' Postgres per primo. Nella versione precedente Google veniva
+chiamato per primo: se la scrittura su Postgres falliva subito dopo, restava un
+appuntamento `confirmed` senza piu' l'evento sul calendario, invisibile a
+qualunque riconciliazione.
+
+**Contratto di cancellazione.** Il successo significa che l'appuntamento
+autorevole e' stato annullato in Postgres. La proiezione su Google puo'
+riconciliare in modo asincrono: un fallimento di Google dopo il commit non fa
+fallire l'operazione, non blocca la notifica al cliente e viene ripreso dal job
+`calendar-sync`. `requireCalendarSync` resta accettato per compatibilita' ma su
+questo percorso non provoca piu' un rilancio — dopo il commit non ci sarebbe
+niente da annullare e il chiamante ritenterebbe un'operazione che non puo' piu'
+riuscire.
 
 ## Flow Conversazionale WhatsApp
 
