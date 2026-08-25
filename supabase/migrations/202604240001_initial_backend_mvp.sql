@@ -405,6 +405,49 @@ begin
   end if;
 end $$;
 
+-- L'intervallo occupato da un appuntamento, come range half-open [inizio, fine).
+--
+-- Esiste per una ragione precisa. Scritta per esteso nel vincolo,
+-- `scheduled_at + duration_minutes * interval '1 minute'` NON e' indicizzabile:
+-- l'operatore `timestamptz + interval` e' STABLE, non IMMUTABLE, perche' un
+-- interval puo' contenere giorni o mesi e risolverli dipende dal TimeZone di
+-- sessione. PostgreSQL rifiuta l'intera espressione con SQLSTATE 42P17
+-- («functions in index expression must be marked IMMUTABLE»), la migration
+-- aborta, e su un database nuovo nessuna delle migration successive parte.
+--
+-- `make_interval(mins => n)` produce sempre e solo un intervallo di tempo puro
+-- — 1440 minuti danno '24:00:00', non '1 day' — quindi la somma e' aritmetica
+-- sull'istante e da' lo stesso risultato in ogni fuso, attraversamenti di ora
+-- legale compresi. La dichiarazione IMMUTABLE qui e' vera, non una bugia detta
+-- al pianificatore per farsi accettare l'indice.
+--
+-- `greatest(...)` tiene la funzione totale. `appointments.duration_minutes` non
+-- ha un check di positivita' (a differenza di `services.duration_minutes`):
+-- senza questa clausola una durata non positiva farebbe esplodere `tstzrange`
+-- con lower > upper, trasformando il vincolo in un rifiuto di righe che oggi
+-- il database accetta. Con `greatest` quelle righe danno un range vuoto, e un
+-- range vuoto non si sovrappone a niente: restano fuori dal vincolo esattamente
+-- come lo erano prima.
+create or replace function public.appointment_slot_range(
+  p_scheduled_at timestamptz,
+  p_duration_minutes integer
+)
+returns tstzrange
+language sql
+immutable
+parallel safe
+strict
+as $$
+  select tstzrange(
+    p_scheduled_at,
+    greatest(p_scheduled_at, p_scheduled_at + make_interval(mins => p_duration_minutes)),
+    '[)'
+  )
+$$;
+
+comment on function public.appointment_slot_range(timestamptz, integer) is
+  'Intervallo [inizio, fine) occupato da un appuntamento. IMMUTABLE per poter comparire in una exclusion constraint GiST: make_interval produce un intervallo di solo tempo, quindi la somma non dipende dal TimeZone di sessione.';
+
 do $$
 begin
   if not exists (
@@ -417,11 +460,7 @@ begin
       add constraint appointments_no_confirmed_overlap
       exclude using gist (
         tenant_id with =,
-        tstzrange(
-          scheduled_at,
-          scheduled_at + duration_minutes * interval '1 minute',
-          '[)'
-        ) with &&
+        public.appointment_slot_range(scheduled_at, duration_minutes) with &&
       )
       where (status = 'confirmed');
   end if;

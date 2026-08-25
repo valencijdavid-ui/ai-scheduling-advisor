@@ -116,21 +116,18 @@ export function postgresAvailable(): boolean {
 }
 
 /**
- * Le migration del repository sono usate VERBATIM tranne due dettagli che
- * dipendono dall'ambiente e non dal comportamento sotto test:
+ * Le migration del repository sono usate VERBATIM tranne un dettaglio che
+ * dipende dall'ambiente e non dal comportamento sotto test:
  *
  * 1. l'estensione `vector` non esiste su un Postgres di serie. L'unica cosa
  *    che ne dipende e' l'embedding della knowledge base, che con la
  *    cancellazione non c'entra niente. L'indice hnsw si salta gia' da solo:
  *    la migration lo crea solo se l'estensione risulta installata.
  *
- * 2. il vincolo di esclusione `appointments_no_confirmed_overlap` usa
- *    `scheduled_at + duration_minutes * interval '1 minute'`, e
- *    `timestamptz + interval` e' STABLE, non IMMUTABLE: Postgres rifiuta di
- *    indicizzarlo. Non e' una peculiarita' locale — vale su qualunque
- *    PostgreSQL, Supabase compreso. E' un difetto reale della migration
- *    iniziale, fuori dallo scopo di P0-3A; qui il blocco viene saltato per
- *    poter esercitare tutto il resto dello schema.
+ * Il vincolo di esclusione `appointments_no_confirmed_overlap` era la seconda
+ * deroga: la sua espressione non era indicizzabile e il blocco veniva saltato.
+ * P0-7A l'ha riparata alla fonte, quindi la deroga e' sparita e il vincolo
+ * viene ora applicato verbatim come tutto il resto.
  *
  * Tutto il resto — grafo delle FK, nomi dei vincoli, ON DELETE, RLS, funzioni,
  * grant — resta identico ai file del repository.
@@ -146,10 +143,6 @@ function prepareMigrationSql(raw: string): string {
       // `<=>` e' l'operatore di distanza coseno di pgvector: senza l'estensione
       // non esiste, e il corpo di `match_knowledge_base` non compilerebbe.
       .replace(/kb\.embedding <=> p_query_embedding/g, '0::double precision')
-      .replace(
-        /do \$\$\s*begin\s*if not exists \([\s\S]*?appointments_no_confirmed_overlap[\s\S]*?end \$\$;/,
-        '-- [harness] vincolo di esclusione saltato: espressione STABLE non indicizzabile',
-      )
   );
 }
 
