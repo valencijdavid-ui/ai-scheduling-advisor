@@ -78,6 +78,72 @@ describe('applyRateLimit', () => {
     expect(decision.allowed).toBe(true);
   });
 
+  // ---------------------------------------------------------------------------
+  // PILOT-P0-3A — la cancellazione di un cliente ha una policy sua (R4)
+  //
+  // Prima condivideva `gdprDelete` con la chiusura dell'account: stessa policy,
+  // stessa chiave userId, quindi stesso bucket. Erano due diritti diversi che
+  // spendevano lo stesso budget, e il budget era uno al giorno.
+  // ---------------------------------------------------------------------------
+
+  it('customer erasure does not consume the tenant-account deletion bucket', async () => {
+    const { limit } = RATE_LIMIT_POLICIES.gdprCustomerErasure;
+
+    // Un admin esaurisce l'intera capacita' oraria di cancellazione clienti.
+    for (let i = 0; i < limit; i += 1) {
+      await applyRateLimit('gdprCustomerErasure', { kind: 'userId', value: 'user-gdpr' });
+    }
+
+    // Chiudere l'account del tenant e' un diritto diverso: deve restare intatto.
+    const decision = await applyRateLimit('gdprDelete', { kind: 'userId', value: 'user-gdpr' });
+    expect(decision.allowed).toBe(true);
+  });
+
+  it('tenant-account deletion does not consume the customer-erasure bucket', async () => {
+    // gdprDelete e' 1/24h: una chiamata lo satura.
+    await applyRateLimit('gdprDelete', { kind: 'userId', value: 'user-account' });
+    await expect(
+      applyRateLimit('gdprDelete', { kind: 'userId', value: 'user-account' }),
+    ).rejects.toBeInstanceOf(AppError);
+
+    // E la cancellazione clienti dello stesso utente deve essere ancora piena.
+    const decision = await applyRateLimit('gdprCustomerErasure', {
+      kind: 'userId',
+      value: 'user-account',
+    });
+    expect(decision.allowed).toBe(true);
+    expect(decision.remaining).toBe(RATE_LIMIT_POLICIES.gdprCustomerErasure.limit - 1);
+  });
+
+  it('allows an immediate retry after a single customer erasure request', async () => {
+    // Il servizio e' stato reso ripetibile apposta: se la risposta HTTP si
+    // perde, l'operatore deve poter ripetere subito. Con 1/24h la ritentava
+    // il giorno dopo, il che rendeva inutile tutta quella progettazione.
+    const identifier = { kind: 'userId', value: 'user-retry' } as const;
+
+    await applyRateLimit('gdprCustomerErasure', identifier);
+    const retry = await applyRateLimit('gdprCustomerErasure', identifier);
+
+    expect(retry.allowed).toBe(true);
+  });
+
+  it('still denies customer erasure once the burst is spent', async () => {
+    // Separare i bucket non deve voler dire togliere il limite: una sessione
+    // admin rubata non deve poter svuotare l'anagrafica a raffica.
+    const identifier = { kind: 'userId', value: 'user-burst' } as const;
+    const { limit } = RATE_LIMIT_POLICIES.gdprCustomerErasure;
+
+    for (let i = 0; i < limit; i += 1) {
+      const decision = await applyRateLimit('gdprCustomerErasure', identifier);
+      expect(decision.allowed).toBe(true);
+    }
+
+    await expect(applyRateLimit('gdprCustomerErasure', identifier)).rejects.toMatchObject({
+      code: 'rate_limited',
+      status: 429,
+    });
+  });
+
   it('returns retryAfter >= 0 in the AppError on denial', async () => {
     const policyKey = 'gdprExport'; // limit=1, una chiamata satura.
     await applyRateLimit(policyKey, { kind: 'userId', value: 'user-export' });

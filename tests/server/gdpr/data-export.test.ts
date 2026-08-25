@@ -99,11 +99,15 @@ describe('GdprExportService — exportCustomerData', () => {
         action: 'gdpr.customer.export.requested',
         resourceType: 'customer',
         metadata: expect.objectContaining({
-          customerPhone: '393331112233',
           totalRows: 4,
         }),
       }),
     ]);
+
+    // PILOT-P0-3A: audit_log sopravvive alla cancellazione del tenant, quindi
+    // conservarci il numero del cliente significa conservarlo per sempre —
+    // anche dopo che quel cliente ha esercitato l'Art. 17.
+    expect(repository.auditLogs[0]?.metadata).not.toHaveProperty('customerPhone');
   });
 
   it('responds 404 (not_found) when there is no data for the customer (anti-leak)', async () => {

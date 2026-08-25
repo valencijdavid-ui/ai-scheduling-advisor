@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { AuthSession } from '@/lib/auth/session';
 import {
+  type CustomerErasureRpcResult,
   type GdprDeleteRepository,
   type ScheduledTenantDeletion,
   GdprDeleteService,
@@ -132,13 +133,17 @@ describe('GdprDeleteService — tenant deletion lifecycle', () => {
 });
 
 describe('GdprDeleteService — customer-level deletion', () => {
-  it('deletes a customer immediately and writes an audit log', async () => {
+  it('normalizza il numero e delega tutto a una sola transazione', async () => {
     const repository = new FakeGdprDeleteRepository();
-    repository.customerCounts.set('tenant_1:393331112233', {
-      conversations: 1,
-      messages: 4,
-      appointments: 1,
-      optOuts: 1,
+    repository.erasureResult = rpcResult({
+      deleted: {
+        conversations: 1,
+        messages: 4,
+        appointments: 1,
+        optOuts: 1,
+        voiceEvents: 2,
+        schedulingDecisions: 3,
+      },
     });
     const service = new GdprDeleteService(repository);
 
@@ -149,30 +154,147 @@ describe('GdprDeleteService — customer-level deletion', () => {
       actor: { ipAddress: '203.0.113.6', userAgent: 'Vitest' },
     });
 
-    expect(result.deleted).toBe(7);
-    expect(result.customerPhone).toBe('393331112233');
-    expect(repository.deletions).toEqual([{ tenantId: 'tenant_1', customerPhone: '393331112233' }]);
-    expect(repository.auditLogs).toEqual([
-      expect.objectContaining({
-        action: 'gdpr.customer.deletion.executed',
-        metadata: expect.objectContaining({
-          customerPhone: '393331112233',
-          deleted: 7,
-        }),
-      }),
+    expect(result.localDeletion).toBe('complete');
+    expect(result.deleted.messages).toBe(4);
+    expect(result.deleted.voiceEvents).toBe(2);
+    expect(result.deleted.schedulingDecisions).toBe(3);
+    expect(repository.erasureCalls).toEqual([
+      expect.objectContaining({ tenantId: 'tenant_1', customerPhone: '393331112233' }),
     ]);
+
+    // L'audit lo scrive la transazione SQL, non il service: un audit scritto
+    // fuori dalla transazione potrebbe sopravvivere a un rollback e descrivere
+    // una cancellazione mai avvenuta.
+    expect(repository.auditLogs).toEqual([]);
   });
 
-  it('responds 404 when no customer data exists (anti-leak)', async () => {
-    const service = new GdprDeleteService(new FakeGdprDeleteRepository());
+  it("non rivela piu' se il cliente esiste: zero righe e' un successo", async () => {
+    // Prima rispondeva 404, che e' esattamente la risposta che permette di
+    // enumerare quali numeri esistono nel tenant. E rendeva impossibile
+    // ripetere una richiesta la cui risposta si era persa.
+    const repository = new FakeGdprDeleteRepository();
+    repository.erasureResult = rpcResult({});
+    const service = new GdprDeleteService(repository);
+
+    const result = await service.deleteCustomerData({
+      session: adminSession(),
+      customerPhone: '393331112233',
+      now: NOW,
+    });
+
+    expect(result.localDeletion).toBe('complete');
+    expect(result.deleted.conversations).toBe(0);
+    expect(result.remoteCleanup).toBe('not_required');
+  });
+
+  it('dichiara pending quando esiste debito remoto catturato', async () => {
+    const repository = new FakeGdprDeleteRepository();
+    repository.erasureResult = rpcResult({ pendingObligations: 2 });
+    const service = new GdprDeleteService(repository);
+
+    const result = await service.deleteCustomerData({
+      session: adminSession(),
+      customerPhone: '393331112233',
+      now: NOW,
+    });
+
+    // Mai "completato": in P0-3A nessuno converge il debito remoto.
+    expect(result.remoteCleanup).toBe('pending');
+    expect(result.pendingObligations).toBe(2);
+  });
+
+  it('lo stato peggiore vince: manual_required prevale su pending', async () => {
+    const repository = new FakeGdprDeleteRepository();
+    repository.erasureResult = rpcResult({ pendingObligations: 5, manualRequired: 1 });
+    const service = new GdprDeleteService(repository);
+
+    const result = await service.deleteCustomerData({
+      session: adminSession(),
+      customerPhone: '393331112233',
+      now: NOW,
+    });
+
+    // Dire `pending` lascerebbe credere che basti aspettare.
+    expect(result.remoteCleanup).toBe('manual_required');
+  });
+
+  it('propaga il conteggio dei residui ambigui senza cancellarli', async () => {
+    const repository = new FakeGdprDeleteRepository();
+    repository.erasureResult = rpcResult({ residualSuspected: 1 });
+    const service = new GdprDeleteService(repository);
+
+    const result = await service.deleteCustomerData({
+      session: adminSession(),
+      customerPhone: '393331112233',
+      now: NOW,
+    });
+
+    expect(result.residualSuspected).toBe(1);
+  });
+
+  it('un residuo sospetto impedisce di dichiarare completa la cancellazione locale', async () => {
+    // L'identita' esatta e' sparita, ma e' rimasto qualcosa che potrebbe
+    // essere la stessa persona sotto un altro prefisso. Dire "completo"
+    // metterebbe un titolo rassicurante sopra un lavoro non finito, e nessuno
+    // andrebbe a leggere il contatore in fondo alla risposta.
+    const repository = new FakeGdprDeleteRepository();
+    repository.erasureResult = rpcResult({ residualSuspected: 2 });
+    const service = new GdprDeleteService(repository);
+
+    const result = await service.deleteCustomerData({
+      session: adminSession(),
+      customerPhone: '393331112233',
+      now: NOW,
+    });
+
+    expect(result.localDeletion).toBe('manual_review_required');
+    expect(result.residualSuspected).toBe(2);
+  });
+
+  it("l'ambiguita' locale e il debito Google restano due dimensioni separate", async () => {
+    // Si chiudono in due modi diversi: una rileggendo l'anagrafica, l'altro
+    // cancellando un evento su Google. Confonderle vorrebbe dire chiuderne
+    // una credendo di aver chiuso l'altra.
+    const repository = new FakeGdprDeleteRepository();
+    repository.erasureResult = rpcResult({ residualSuspected: 1, pendingObligations: 3 });
+    const service = new GdprDeleteService(repository);
+
+    const result = await service.deleteCustomerData({
+      session: adminSession(),
+      customerPhone: '393331112233',
+      now: NOW,
+    });
+
+    expect(result.localDeletion).toBe('manual_review_required');
+    expect(result.remoteCleanup).toBe('pending');
+    expect(result.pendingObligations).toBe(3);
+
+    // E il contrario: debito remoto senza ambiguita' locale.
+    repository.erasureResult = rpcResult({ pendingObligations: 3 });
+
+    const clean = await service.deleteCustomerData({
+      session: adminSession(),
+      customerPhone: '393331112233',
+      now: NOW,
+    });
+
+    expect(clean.localDeletion).toBe('complete');
+    expect(clean.remoteCleanup).toBe('pending');
+  });
+
+  it('blocca un ruolo non admin', async () => {
+    const repository = new FakeGdprDeleteRepository();
+    const service = new GdprDeleteService(repository);
 
     await expect(
       service.deleteCustomerData({
-        session: adminSession(),
+        session: { ...ownerSession(), role: 'member' } as AuthSession,
         customerPhone: '393331112233',
         now: NOW,
       }),
-    ).rejects.toMatchObject({ code: 'not_found' });
+    ).rejects.toMatchObject({ code: 'forbidden' });
+
+    expect(repository.erasureCalls).toEqual([]);
   });
 });
 
@@ -182,10 +304,10 @@ class FakeGdprDeleteRepository implements GdprDeleteRepository {
   readonly cleared: string[] = [];
   readonly hardDeleted: string[] = [];
   readonly auditLogs: AuditLogInput[] = [];
-  readonly customerCounts = new Map<string, ReturnType<typeof zeroBreakdown>>();
-  readonly deletions: Array<{ tenantId: string; customerPhone: string }> = [];
+  readonly erasureCalls: Array<{ tenantId: string; customerPhone: string; requestId: string }> = [];
 
   scheduledList: ScheduledTenantDeletion[] = [];
+  erasureResult: CustomerErasureRpcResult = rpcResult({});
 
   async getTenantDeletionStatus(
     tenantId: string,
@@ -226,19 +348,18 @@ class FakeGdprDeleteRepository implements GdprDeleteRepository {
     this.tenants.delete(tenantId);
   }
 
-  async countCustomerRows(input: {
+  async eraseCustomerData(input: {
     tenantId: string;
     customerPhone: string;
-  }): Promise<ReturnType<typeof zeroBreakdown>> {
-    return this.customerCounts.get(`${input.tenantId}:${input.customerPhone}`) ?? zeroBreakdown();
-  }
+    requestId: string;
+  }): Promise<CustomerErasureRpcResult> {
+    this.erasureCalls.push({
+      tenantId: input.tenantId,
+      customerPhone: input.customerPhone,
+      requestId: input.requestId,
+    });
 
-  async deleteCustomerRows(input: {
-    tenantId: string;
-    customerPhone: string;
-  }): Promise<ReturnType<typeof zeroBreakdown>> {
-    this.deletions.push(input);
-    return this.customerCounts.get(`${input.tenantId}:${input.customerPhone}`) ?? zeroBreakdown();
+    return { ...this.erasureResult, requestId: input.requestId };
   }
 
   async recordAuditLog(input: AuditLogInput): Promise<void> {
@@ -246,13 +367,30 @@ class FakeGdprDeleteRepository implements GdprDeleteRepository {
   }
 }
 
-function zeroBreakdown(): {
-  conversations: number;
-  messages: number;
-  appointments: number;
-  optOuts: number;
-} {
-  return { conversations: 0, messages: 0, appointments: 0, optOuts: 0 };
+function rpcResult(overrides: Partial<CustomerErasureRpcResult>): CustomerErasureRpcResult {
+  const residualSuspected = overrides.residualSuspected ?? 0;
+
+  return {
+    requestId: '00000000-0000-4000-8000-000000000000',
+    executedAt: NOW.toISOString(),
+    // Rispecchia la regola della transazione SQL, cosi' un fixture non puo'
+    // descrivere uno stato che il database non produrrebbe mai.
+    localDeletion: residualSuspected > 0 ? 'manual_review_required' : 'complete',
+    dissociatedAppointments: 0,
+    pendingObligations: 0,
+    manualRequired: 0,
+    residualSuspected: 0,
+    ...overrides,
+    deleted: {
+      conversations: 0,
+      messages: 0,
+      appointments: 0,
+      optOuts: 0,
+      voiceEvents: 0,
+      schedulingDecisions: 0,
+      ...overrides.deleted,
+    },
+  };
 }
 
 function ownerSession(): AuthSession {

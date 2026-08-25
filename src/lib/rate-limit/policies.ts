@@ -34,8 +34,30 @@ export const RATE_LIMIT_POLICIES = {
   settingsWrite: { window: 1 * MINUTE, limit: 30 },
   /** Export GDPR (1 / 24h). */
   gdprExport: { window: 1 * DAY, limit: 1 },
-  /** Cancellazione GDPR (1 / 24h). */
+  /** Chiusura account tenant (1 / 24h). Irreversibile, ne basta una. */
   gdprDelete: { window: 1 * DAY, limit: 1 },
+  /**
+   * Cancellazione GDPR di un cliente finale (20 / ora per utente).
+   *
+   * Deliberatamente separata da `gdprDelete`, per due ragioni.
+   *
+   * La prima e' che condividere la chiave significava condividere il budget:
+   * cancellare un cliente consumava la possibilita' di chiudere l'account del
+   * tenant per 24 ore, e viceversa. Sono due diritti diversi, non due usi
+   * dello stesso.
+   *
+   * La seconda e' che 1/24h contraddiceva il servizio che limita. La
+   * cancellazione customer e' stata resa ripetibile apposta, perche' se la
+   * risposta HTTP si perde l'operatore deve poter ripetere senza che il
+   * sistema conservi un'impronta del cliente per riconoscere il tentativo; un
+   * limite da una richiesta al giorno rendeva quella ripetizione impossibile.
+   * E uno studio che riceve tre richieste Art. 17 in una settimana non puo'
+   * onorarne una al giorno.
+   *
+   * Resta stretta abbastanza da contare: 20 all'ora non e' il ritmo con cui si
+   * svuota un'anagrafica da una sessione admin rubata.
+   */
+  gdprCustomerErasure: { window: 1 * HOUR, limit: 20 },
   /** Contact form pubblico (5 / minuto per IP, anti-spam). */
   contactForm: { window: 1 * MINUTE, limit: 5 },
 } as const satisfies Record<string, RateLimitPolicy>;

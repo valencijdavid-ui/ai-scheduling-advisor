@@ -64,6 +64,30 @@ export interface WatchdogCalendarStats {
   availabilityBrokenIntegrations: number;
 }
 
+/**
+ * Debito di cancellazione di PII su sistemi esterni (PILOT-P0-3A).
+ *
+ * Sono conteggi cross-tenant senza nessun dato del cliente: al watchdog serve
+ * sapere QUANTO debito remoto e' aperto, non di chi.
+ */
+export interface WatchdogErasureStats {
+  /**
+   * Obbligazioni catturate e non ancora convergute.
+   *
+   * In P0-3A un valore > 0 e' NORMALE, non un guasto: il worker remoto non
+   * esiste ancora (arriva in P0-3C) e ogni obbligazione nasce con
+   * `next_attempt_at` NULL, cioe' deliberatamente non eseguibile. Serve
+   * visibilita', non un allarme — allarmare qui vorrebbe dire suonare senza
+   * sosta per una condizione che sappiamo gia' e che nessuno puo' risolvere.
+   */
+  pendingObligations: number;
+  /**
+   * Obbligazioni che nessun automatismo potra' mai chiudere: identita' remota
+   * ignota, o autorita' Google perduta. Qui serve una persona.
+   */
+  manualRequiredObligations: number;
+}
+
 export interface WatchdogReport {
   readonly status: WatchdogStatus;
   readonly checkedAt: string;
@@ -75,6 +99,7 @@ export interface WatchdogReport {
   readonly deadLetterJobs: number;
   readonly oldestPendingMinutes: number | null;
   readonly calendar: WatchdogCalendarStats;
+  readonly erasure: WatchdogErasureStats;
   readonly reasons: readonly string[];
   readonly notified: boolean;
 }
@@ -93,6 +118,7 @@ export interface WatchdogRepository {
     urgentBefore: Date;
     staleBefore: Date;
   }): Promise<WatchdogCalendarStats>;
+  readErasureObligationStats(): Promise<WatchdogErasureStats>;
 }
 
 export interface WatchdogOptions {
@@ -126,6 +152,7 @@ export class HealthWatchdogService {
       urgentBefore: new Date(now.getTime() + CALENDAR_SYNC_URGENT_WINDOW_MS),
       staleBefore: new Date(now.getTime() - calendarStaleAfterMinutes * 60_000),
     });
+    const erasure = await this.repository.readErasureObligationStats();
 
     const oldestPendingMinutes =
       stats.oldestPendingAt === null
@@ -189,6 +216,19 @@ export class HealthWatchdogService {
       );
     }
 
+    // Debito di cancellazione remota che nessun automatismo chiudera'.
+    //
+    // Solo `manual_required` alza lo stato. Le obbligazioni `pending` sono
+    // visibili nel report ma non allarmano: fino a P0-3C non esiste un worker
+    // che possa convergerle, quindi sarebbero un allarme permanente per una
+    // condizione nota e attesa.
+    if (erasure.manualRequiredObligations > 0) {
+      status = 'critical';
+      reasons.push(
+        `${erasure.manualRequiredObligations} cancellazioni di dati cliente su Google Calendar non possono essere completate in automatico: vanno chiuse a mano seguendo docs/runbook-erasure-obligations.md.`,
+      );
+    }
+
     const report: WatchdogReport = {
       status,
       checkedAt: now.toISOString(),
@@ -197,6 +237,7 @@ export class HealthWatchdogService {
       deadLetterJobs: stats.deadLetterJobs,
       oldestPendingMinutes,
       calendar,
+      erasure,
       reasons,
       notified: false,
     };
@@ -409,6 +450,36 @@ class SupabaseWatchdogRepository implements WatchdogRepository {
       urgentUnsynced: urgent.count ?? 0,
       staleSyncs: stale.count ?? 0,
       availabilityBrokenIntegrations: availabilityBroken.count ?? 0,
+    };
+  }
+
+  /**
+   * Debito di cancellazione remota aperto (PILOT-P0-3A).
+   *
+   * Solo conteggi: la tabella non contiene dati del cliente e da qui non ne
+   * esce nessun identificativo.
+   */
+  async readErasureObligationStats(): Promise<WatchdogErasureStats> {
+    const [pending, manualRequired] = await Promise.all([
+      this.supabase
+        .from('erasure_obligations')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'pending'),
+      this.supabase
+        .from('erasure_obligations')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'manual_required'),
+    ]);
+
+    const failure = pending.error ?? manualRequired.error;
+
+    if (failure) {
+      throw new AppError('internal', 'Failed to read erasure obligation stats', { cause: failure });
+    }
+
+    return {
+      pendingObligations: pending.count ?? 0,
+      manualRequiredObligations: manualRequired.count ?? 0,
     };
   }
 }
