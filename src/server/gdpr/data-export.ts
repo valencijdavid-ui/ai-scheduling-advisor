@@ -223,8 +223,14 @@ export class GdprExportService {
       resourceId: null,
       ipAddress: input.actor?.ipAddress ?? null,
       userAgent: input.actor?.userAgent ?? null,
+      // PILOT-P0-3A: niente `customerPhone`.
+      //
+      // audit_log e' progettato per sopravvivere alla cancellazione del tenant
+      // (tenant_id ON DELETE SET NULL): conservarci il numero del cliente
+      // significava che l'identificativo restava in chiaro per sempre, anche
+      // dopo che lo stesso cliente aveva esercitato l'Art. 17. Chi ha chiesto
+      // l'export resta ricostruibile da attore, tenant e timestamp.
       metadata: {
-        customerPhone,
         totalRows,
         conversations: conversations.length,
         messages: messages.length,

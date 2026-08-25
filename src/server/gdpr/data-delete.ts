@@ -1,4 +1,5 @@
 // Fatto da Claude Code l'8 maggio 2026.
+// Cancellazione customer riscritta in PILOT-P0-3A il 25 agosto 2026.
 //
 // GDPR Art. 17 — Diritto alla cancellazione (right to be forgotten).
 //
@@ -9,7 +10,29 @@
 //      finale (no grace period — il customer non ha login, e' un GDPR
 //      request che il tenant onora subito).
 //
+// PILOT-P0-3A — cosa e' cambiato nel percorso customer e perche':
+//
+// Prima erano cinque DELETE indipendenti via PostgREST, nell'ordine
+// sbagliato: i messaggi venivano cancellati e committati, poi la
+// cancellazione della conversazione falliva con 23503 su
+// `appointments_conversation_id_fkey` e il resto non veniva mai eseguito.
+// Nessun rollback, nessun audit: dati del cliente distrutti a meta'.
+// Ora e' UNA chiamata a `public.erase_customer_data`, cioe' una sola
+// transazione Postgres che include anche l'audit.
+//
+// La transazione cattura anche l'identita' degli eventi Google del cliente
+// in `erasure_obligations`, perche' quando la riga locale sparisce sparisce
+// l'unico puntatore all'evento remoto — che contiene il suo telefono.
+//
+// CONFINE DI FASE: P0-3A cattura il debito remoto, non lo esegue. Nessuna
+// chiamata a Google parte da questo modulo. La convergenza remota arriva in
+// P0-3C. `remoteCleanup` non vale mai "completato" in questa fase.
+//
 // Pattern allineato a data-export.ts e conversations/inbox.ts.
+
+import { randomUUID } from 'node:crypto';
+
+import { z } from 'zod';
 
 import type { AuthSession } from '@/lib/auth/session';
 import { AppError } from '@/lib/errors/app-error';
@@ -22,6 +45,9 @@ import {
 
 export const TENANT_DELETION_GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 
+/** SQLSTATE invalid_parameter_value: numero cliente non normalizzabile. */
+const PG_INVALID_PARAMETER_VALUE = '22023';
+
 export type TenantDeletionRequest = {
   tenantId: string;
   requestedAt: string;
@@ -29,17 +55,92 @@ export type TenantDeletionRequest = {
   status: 'scheduled' | 'cancelled' | 'executed';
 };
 
+export type CustomerErasureBreakdown = {
+  conversations: number;
+  messages: number;
+  appointments: number;
+  optOuts: number;
+  voiceEvents: number;
+  schedulingDecisions: number;
+};
+
+/**
+ * Stato della cancellazione sui sistemi esterni.
+ *
+ * Non esiste il valore "completato": in P0-3A nessuno converge il debito
+ * remoto, quindi dichiararlo concluso sarebbe una bugia. Lo stato terminale
+ * positivo arrivera' con il worker di P0-3C.
+ */
+export type RemoteCleanupState = 'not_required' | 'pending' | 'manual_required';
+
+/**
+ * Esito della cancellazione LOCALE.
+ *
+ * `complete` significa che l'identita' normalizzata esatta e' sparita e che
+ * non e' rimasto niente che possa essere lo stesso soggetto.
+ *
+ * `manual_review_required` significa che la transazione ha committato, ma sono
+ * rimaste righe che potrebbero essere la stessa persona sotto un prefisso
+ * diverso. Sono un'unione, non un booleano a parte, perche' cosi' nessun
+ * consumatore puo' leggere l'esito senza incontrare anche questo caso: un flag
+ * accanto a `complete` sarebbe stato ignorabile a costo zero.
+ *
+ * Dimensione distinta da `RemoteCleanupState`: quello e' debito GOOGLE, questo
+ * e' ambiguita' di identita' locale. Si chiudono in due modi diversi.
+ */
+export type LocalDeletionState = 'complete' | 'manual_review_required';
+
 export type CustomerDeletionResult = {
   tenantId: string;
-  customerPhone: string;
-  deleted: number;
-  breakdown: {
-    conversations: number;
-    messages: number;
-    appointments: number;
-    optOuts: number;
-  };
+  /** Correla questa cancellazione con il suo debito remoto e con l'audit. */
+  requestId: string;
+  /** Esito locale. Non dice nulla sul remoto. */
+  localDeletion: LocalDeletionState;
+  deleted: CustomerErasureBreakdown;
+  /** Appuntamenti di ALTRI clienti sganciati dalle conversazioni cancellate. */
+  dissociatedAppointments: number;
+  remoteCleanup: RemoteCleanupState;
+  /** Eventi Google noti da cancellare (non ancora eseguibili in P0-3A). */
+  pendingObligations: number;
+  /** Debito che richiede un operatore: identita' remota ignota. */
+  manualRequired: number;
+  /**
+   * Righe rimaste che potrebbero essere lo stesso soggetto con un prefisso
+   * internazionale diverso. Rilevate, MAI cancellate automaticamente.
+   */
+  residualSuspected: number;
 };
+
+/**
+ * Esito della RPC. Parsato con Zod come ogni input esterno: la funzione SQL
+ * e' un contratto, non una fonte fidata.
+ */
+const CustomerErasureRpcResultSchema = z.object({
+  requestId: z.string(),
+  executedAt: z.string(),
+  /**
+   * Lo decide la transazione, non il service.
+   *
+   * Il conteggio dei residui e l'esito che ne discende nascono nello stesso
+   * statement: ricalcolarlo qui vorrebbe dire tenere in piedi due definizioni
+   * della stessa verita' e sperare che non divergano.
+   */
+  localDeletion: z.enum(['complete', 'manual_review_required']),
+  deleted: z.object({
+    conversations: z.number().int().nonnegative(),
+    messages: z.number().int().nonnegative(),
+    appointments: z.number().int().nonnegative(),
+    optOuts: z.number().int().nonnegative(),
+    voiceEvents: z.number().int().nonnegative(),
+    schedulingDecisions: z.number().int().nonnegative(),
+  }),
+  dissociatedAppointments: z.number().int().nonnegative(),
+  pendingObligations: z.number().int().nonnegative(),
+  manualRequired: z.number().int().nonnegative(),
+  residualSuspected: z.number().int().nonnegative(),
+});
+
+export type CustomerErasureRpcResult = z.infer<typeof CustomerErasureRpcResultSchema>;
 
 export type ScheduledTenantDeletion = {
   tenantId: string;
@@ -55,14 +156,20 @@ export interface GdprDeleteRepository {
   clearTenantSoftDelete(tenantId: string): Promise<boolean>;
   listTenantsDueForHardDelete(now: Date): Promise<ScheduledTenantDeletion[]>;
   hardDeleteTenant(tenantId: string): Promise<void>;
-  countCustomerRows(input: {
+  /**
+   * Cancellazione locale + cattura del debito remoto in UNA transazione.
+   *
+   * L'audit e' scritto dentro la stessa transazione: un audit che sopravvive
+   * a una cancellazione fallita descriverebbe qualcosa che non e' successo.
+   */
+  eraseCustomerData(input: {
     tenantId: string;
     customerPhone: string;
-  }): Promise<CustomerDeletionResult['breakdown']>;
-  deleteCustomerRows(input: {
-    tenantId: string;
-    customerPhone: string;
-  }): Promise<CustomerDeletionResult['breakdown']>;
+    requestId: string;
+    userId: string | null;
+    ipAddress: string | null;
+    userAgent: string | null;
+  }): Promise<CustomerErasureRpcResult>;
   recordAuditLog(input: AuditLogInput): Promise<void>;
 }
 
@@ -198,56 +305,66 @@ export class GdprDeleteService {
     return this.repository.listTenantsDueForHardDelete(now);
   }
 
+  /**
+   * Cancellazione dei dati di un cliente finale.
+   *
+   * Nessun conteggio preventivo e nessun 404 su "zero righe": la risposta non
+   * rivela piu' se quel numero esista nel tenant, e la richiesta diventa
+   * ripetibile. Serve davvero — se la prima chiamata committa e la risposta
+   * HTTP si perde, l'operatore deve poter ripetere senza che il sistema debba
+   * conservare un'impronta del cliente per riconoscerlo.
+   */
   async deleteCustomerData(input: {
     session: AuthSession;
     customerPhone: string;
     actor?: Pick<GdprActor, 'ipAddress' | 'userAgent'>;
+    requestId?: string;
     now?: Date;
   }): Promise<CustomerDeletionResult> {
     assertGdprAdmin(input.session);
     const customerPhone = normalizeCustomerPhone(input.customerPhone);
-    const before = await this.repository.countCustomerRows({
+    const requestId = input.requestId ?? randomUUID();
+
+    const result = await this.repository.eraseCustomerData({
       tenantId: input.session.tenantId,
       customerPhone,
-    });
-    const totalBefore =
-      before.conversations + before.messages + before.appointments + before.optOuts;
-
-    if (totalBefore === 0) {
-      // GDPR no-leak: rispondiamo 404 invece di rivelare assenza dati.
-      throw new AppError('not_found', 'No data found for the given customer');
-    }
-
-    const breakdown = await this.repository.deleteCustomerRows({
-      tenantId: input.session.tenantId,
-      customerPhone,
-    });
-    const deleted =
-      breakdown.conversations + breakdown.messages + breakdown.appointments + breakdown.optOuts;
-
-    await this.repository.recordAuditLog({
-      tenantId: input.session.tenantId,
+      requestId,
       userId: input.session.userId,
-      action: 'gdpr.customer.deletion.executed',
-      resourceType: 'customer',
-      resourceId: null,
       ipAddress: input.actor?.ipAddress ?? null,
       userAgent: input.actor?.userAgent ?? null,
-      metadata: {
-        customerPhone,
-        deleted,
-        breakdown,
-        executedAt: (input.now ?? new Date()).toISOString(),
-      },
     });
 
     return {
       tenantId: input.session.tenantId,
-      customerPhone,
-      deleted,
-      breakdown,
+      requestId: result.requestId,
+      localDeletion: result.localDeletion,
+      deleted: result.deleted,
+      dissociatedAppointments: result.dissociatedAppointments,
+      remoteCleanup: resolveRemoteCleanupState(result),
+      pendingObligations: result.pendingObligations,
+      manualRequired: result.manualRequired,
+      residualSuspected: result.residualSuspected,
     };
   }
+}
+
+/**
+ * Lo stato peggiore vince.
+ *
+ * Se esiste anche solo un'obbligazione che nessun automatismo potra' chiudere,
+ * l'esito complessivo e' `manual_required`: dire `pending` lascerebbe credere
+ * che basti aspettare.
+ */
+function resolveRemoteCleanupState(result: CustomerErasureRpcResult): RemoteCleanupState {
+  if (result.manualRequired > 0) {
+    return 'manual_required';
+  }
+
+  if (result.pendingObligations > 0) {
+    return 'pending';
+  }
+
+  return 'not_required';
 }
 
 export class SupabaseGdprDeleteRepository implements GdprDeleteRepository {
@@ -336,148 +453,39 @@ export class SupabaseGdprDeleteRepository implements GdprDeleteRepository {
     }
   }
 
-  async countCustomerRows(input: {
+  /**
+   * Una sola chiamata: `public.erase_customer_data` fa tutto dentro una
+   * transazione (cancellazioni, cattura del debito remoto, audit).
+   *
+   * La funzione e' SECURITY INVOKER e gira con la service-role key gia' usata
+   * da questo client; l'autorizzazione owner/admin resta a monte nel service.
+   */
+  async eraseCustomerData(input: {
     tenantId: string;
     customerPhone: string;
-  }): Promise<CustomerDeletionResult['breakdown']> {
-    const [conversationsResult, appointmentsResult, optOutsResult] = await Promise.all([
-      this.supabase
-        .from('conversations')
-        .select('id', { count: 'exact' })
-        .eq('tenant_id', input.tenantId)
-        .eq('customer_identifier', input.customerPhone),
-      this.supabase
-        .from('appointments')
-        .select('id', { count: 'exact' })
-        .eq('tenant_id', input.tenantId)
-        .or(
-          `customer_identifier.eq.${input.customerPhone},customer_phone.eq.${input.customerPhone}`,
-        ),
-      this.supabase
-        .from('opt_outs')
-        .select('id', { count: 'exact' })
-        .eq('tenant_id', input.tenantId)
-        .eq('customer_identifier', input.customerPhone),
-    ]);
+    requestId: string;
+    userId: string | null;
+    ipAddress: string | null;
+    userAgent: string | null;
+  }): Promise<CustomerErasureRpcResult> {
+    const { data, error } = await this.supabase.rpc('erase_customer_data', {
+      p_tenant_id: input.tenantId,
+      p_customer_phone: input.customerPhone,
+      p_request_id: input.requestId,
+      p_user_id: input.userId,
+      p_ip_address: input.ipAddress,
+      p_user_agent: input.userAgent,
+    });
 
-    if (conversationsResult.error) {
-      throw toRepositoryError('Failed to count customer conversations', conversationsResult.error);
-    }
-    if (appointmentsResult.error) {
-      throw toRepositoryError('Failed to count customer appointments', appointmentsResult.error);
-    }
-    if (optOutsResult.error) {
-      throw toRepositoryError('Failed to count customer opt-outs', optOutsResult.error);
-    }
-
-    const conversationIds = ((conversationsResult.data ?? []) as Array<{ id: string }>).map(
-      (row) => row.id,
-    );
-
-    let messagesCount = 0;
-    if (conversationIds.length > 0) {
-      const messagesResult = await this.supabase
-        .from('messages')
-        .select('id', { count: 'exact', head: true })
-        .eq('tenant_id', input.tenantId)
-        .in('conversation_id', conversationIds);
-
-      if (messagesResult.error) {
-        throw toRepositoryError('Failed to count customer messages', messagesResult.error);
+    if (error) {
+      if ((error as { code?: string }).code === PG_INVALID_PARAMETER_VALUE) {
+        throw new AppError('bad_request', 'Invalid customer phone number', { cause: error });
       }
 
-      messagesCount = messagesResult.count ?? 0;
+      throw toRepositoryError('Failed to erase customer data', error);
     }
 
-    return {
-      conversations: conversationsResult.count ?? conversationIds.length,
-      messages: messagesCount,
-      appointments: appointmentsResult.count ?? 0,
-      optOuts: optOutsResult.count ?? 0,
-    };
-  }
-
-  async deleteCustomerRows(input: {
-    tenantId: string;
-    customerPhone: string;
-  }): Promise<CustomerDeletionResult['breakdown']> {
-    // Tipicamente messages e' on delete cascade dalla conversation, quindi
-    // cancelliamo le conversations e poi appointments + opt_outs.
-    const breakdown: CustomerDeletionResult['breakdown'] = {
-      conversations: 0,
-      messages: 0,
-      appointments: 0,
-      optOuts: 0,
-    };
-
-    const conversations = await this.supabase
-      .from('conversations')
-      .select('id')
-      .eq('tenant_id', input.tenantId)
-      .eq('customer_identifier', input.customerPhone);
-
-    if (conversations.error) {
-      throw toRepositoryError('Failed to read conversations for delete', conversations.error);
-    }
-
-    const conversationIds = ((conversations.data ?? []) as Array<{ id: string }>).map(
-      (row) => row.id,
-    );
-
-    if (conversationIds.length > 0) {
-      const messagesDelete = await this.supabase
-        .from('messages')
-        .delete({ count: 'exact' })
-        .eq('tenant_id', input.tenantId)
-        .in('conversation_id', conversationIds);
-
-      if (messagesDelete.error) {
-        throw toRepositoryError('Failed to delete customer messages', messagesDelete.error);
-      }
-
-      breakdown.messages = messagesDelete.count ?? 0;
-
-      const conversationsDelete = await this.supabase
-        .from('conversations')
-        .delete({ count: 'exact' })
-        .eq('tenant_id', input.tenantId)
-        .in('id', conversationIds);
-
-      if (conversationsDelete.error) {
-        throw toRepositoryError(
-          'Failed to delete customer conversations',
-          conversationsDelete.error,
-        );
-      }
-
-      breakdown.conversations = conversationsDelete.count ?? conversationIds.length;
-    }
-
-    const appointmentsDelete = await this.supabase
-      .from('appointments')
-      .delete({ count: 'exact' })
-      .eq('tenant_id', input.tenantId)
-      .or(`customer_identifier.eq.${input.customerPhone},customer_phone.eq.${input.customerPhone}`);
-
-    if (appointmentsDelete.error) {
-      throw toRepositoryError('Failed to delete customer appointments', appointmentsDelete.error);
-    }
-
-    breakdown.appointments = appointmentsDelete.count ?? 0;
-
-    const optOutsDelete = await this.supabase
-      .from('opt_outs')
-      .delete({ count: 'exact' })
-      .eq('tenant_id', input.tenantId)
-      .eq('customer_identifier', input.customerPhone);
-
-    if (optOutsDelete.error) {
-      throw toRepositoryError('Failed to delete customer opt-outs', optOutsDelete.error);
-    }
-
-    breakdown.optOuts = optOutsDelete.count ?? 0;
-
-    return breakdown;
+    return CustomerErasureRpcResultSchema.parse(data);
   }
 
   async recordAuditLog(input: AuditLogInput): Promise<void> {

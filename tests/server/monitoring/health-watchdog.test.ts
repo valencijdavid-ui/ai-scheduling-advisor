@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   HealthWatchdogService,
   type WatchdogCalendarStats,
+  type WatchdogErasureStats,
   type WatchdogQueueStats,
   type WatchdogRepository,
 } from '@/server/monitoring/health-watchdog';
@@ -13,6 +14,7 @@ const NOW = new Date('2026-07-27T12:00:00.000Z');
 function repositoryReturning(
   stats: Partial<WatchdogQueueStats>,
   calendar: Partial<WatchdogCalendarStats> = {},
+  erasure: Partial<WatchdogErasureStats> = {},
 ): WatchdogRepository {
   return {
     async readQueueStats() {
@@ -31,6 +33,13 @@ function repositoryReturning(
         urgentUnsynced: 0,
         staleSyncs: 0,
         ...calendar,
+      };
+    },
+    async readErasureObligationStats() {
+      return {
+        pendingObligations: 0,
+        manualRequiredObligations: 0,
+        ...erasure,
       };
     },
   };
@@ -190,6 +199,37 @@ describe('HealthWatchdogService', () => {
     expect(sender.sent[0]?.text).toContain('runbook-calendar-availability.md');
   });
 
+  it('rende visibile il debito di cancellazione che richiede un operatore', async () => {
+    // PILOT-P0-3A: un evento Google con dentro il telefono del cliente che
+    // nessun automatismo potra' mai cancellare. Non e' un ritardo: e' un
+    // obbligo GDPR aperto che resta aperto finche' non lo chiude una persona.
+    const sender = recordingSender();
+    const report = await makeService(
+      repositoryReturning({}, {}, { manualRequiredObligations: 2 }),
+      sender,
+    ).check();
+
+    expect(report.status).toBe('critical');
+    expect(report.erasure.manualRequiredObligations).toBe(2);
+    expect(sender.sent[0]?.text).toContain('runbook-erasure-obligations.md');
+  });
+
+  it('mostra le obbligazioni pending senza allarmare: in P0-3A non sono convergibili', async () => {
+    // Il worker remoto arriva in P0-3C. Fino ad allora ogni obbligazione nasce
+    // pending e non eseguibile: allarmare qui vorrebbe dire suonare in
+    // continuazione per una condizione nota, attesa e non risolvibile — cioe'
+    // insegnare all'operatore a ignorare il watchdog.
+    const sender = recordingSender();
+    const report = await makeService(
+      repositoryReturning({}, {}, { pendingObligations: 7 }),
+      sender,
+    ).check();
+
+    expect(report.erasure.pendingObligations).toBe(7);
+    expect(report.status).toBe('ok');
+    expect(sender.sent).toEqual([]);
+  });
+
   it('rileva il reconciler del calendario fermo', async () => {
     const sender = recordingSender();
     const report = await makeService(repositoryReturning({}, { staleSyncs: 5 }), sender).check();
@@ -229,6 +269,9 @@ describe('HealthWatchdogService', () => {
           availabilityBrokenIntegrations: 0,
         };
       },
+      async readErasureObligationStats() {
+        return { pendingObligations: 0, manualRequiredObligations: 0 };
+      },
     };
 
     await new HealthWatchdogService(repository, recordingSender(), { now: () => NOW }).check();
@@ -250,6 +293,9 @@ describe('HealthWatchdogService', () => {
           staleSyncs: 0,
           availabilityBrokenIntegrations: 0,
         };
+      },
+      async readErasureObligationStats() {
+        return { pendingObligations: 0, manualRequiredObligations: 0 };
       },
     };
 

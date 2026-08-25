@@ -88,6 +88,30 @@ const requiredSnippets = [
   'voice_messages_count integer not null default 0',
   'p_voice_messages_delta integer default 0',
   'usage_metrics_tenant_month_idx',
+  // PILOT-P0-3A. Sono invarianti, non dettagli: se una di queste righe sparisce
+  // la cancellazione GDPR torna a poter distruggere dati a meta' o a perdere il
+  // debito di cancellazione remota.
+  'create table if not exists public.erasure_obligations',
+  // La FK verso tenants e' vietata: il commento e' il punto in cui l'invariante
+  // e' spiegata, e va tenuto in piedi insieme al vincolo.
+  'AGGIUNGERE UNA FOREIGN KEY VERSO public.tenants E',
+  'erasure_obligations_known_event_unique_idx',
+  // Un evento noto senza calendario non puo' vivere in uno stato eseguibile:
+  // e' il vincolo che impedisce di inventare un calendario pur di far passare
+  // una riga, e quindi di far convergere su un 404 un debito mai onorato.
+  'erasure_obligations_executable_needs_calendar',
+  // last_error_code resta un codice: senza questo vincolo diventa il posto
+  // dove finirebbe il corpo della risposta di Google, che contiene PII.
+  'erasure_obligations_error_code_is_bounded',
+  // La dedup dell'identita' remota. Senza, due appuntamenti che puntano allo
+  // stesso evento fanno abortire la RPC e la cancellazione di quel cliente
+  // diventa impossibile per sempre.
+  'select distinct',
+  'create or replace function public.erase_customer_data',
+  'security invoker',
+  'revoke execute on function public.erase_customer_data',
+  'grant execute on function public.erase_customer_data',
+  'add column if not exists calendar_event_calendar_id text',
 ];
 
 const missingSnippets = requiredSnippets.filter((snippet) => !sql.includes(snippet));

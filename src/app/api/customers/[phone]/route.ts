@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { jsonHandler } from '@/lib/api/json';
 import { readJsonBody } from '@/lib/api/body';
 import { requireSession } from '@/lib/auth/session';
+import { applyRateLimit } from '@/lib/rate-limit/apply';
 import { createGdprDeleteService } from '@/server/gdpr/data-delete';
 
 export const runtime = 'nodejs';
@@ -29,6 +30,17 @@ export async function DELETE(
 ): Promise<Response> {
   return jsonHandler(async (apiContext) => {
     const session = await requireSession();
+
+    // Rate limit GDPR Art. 17 — policy PROPRIA, non quella della chiusura
+    // account: bucket separato, cosi' cancellare un cliente non consuma il
+    // diritto di chiudere il tenant (e viceversa), e la ripetizione di una
+    // richiesta la cui risposta si e' persa non e' bloccata per 24 ore.
+    //
+    // Applicato PRIMA di leggere il body: la confirmation phrase non deve
+    // essere brute-forzabile, e una sessione admin rubata non deve poter
+    // svuotare l'anagrafica clienti a raffica.
+    await applyRateLimit('gdprCustomerErasure', { kind: 'userId', value: session.userId });
+
     const { phone } = await context.params;
     const validatedPhone = PhoneParamSchema.parse(decodeURIComponent(phone));
 
