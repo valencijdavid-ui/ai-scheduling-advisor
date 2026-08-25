@@ -52,6 +52,16 @@ export interface WatchdogCalendarStats {
   urgentUnsynced: number;
   /** Righe dovute da troppo tempo: il reconciler stesso non sta girando. */
   staleSyncs: number;
+  /**
+   * Integrazioni Google attive che portano un guasto permanente di VERIFICA
+   * della disponibilita' (PILOT-P0-2).
+   *
+   * E' una condizione permanente, non un picco: finche' resta, quel tenant non
+   * puo' prenotare nulla via WhatsApp, e il sintomo che l'operatore vede — un
+   * numero che smette di prendere appuntamenti — e' identico a una giornata
+   * tranquilla. Senza questo conteggio il guasto e' invisibile per costruzione.
+   */
+  availabilityBrokenIntegrations: number;
 }
 
 export interface WatchdogReport {
@@ -172,6 +182,13 @@ export class HealthWatchdogService {
       );
     }
 
+    if (calendar.availabilityBrokenIntegrations > 0) {
+      status = 'critical';
+      reasons.push(
+        `${calendar.availabilityBrokenIntegrations} integrazioni Google Calendar non riescono piu' a verificare la disponibilita': quei tenant non stanno prendendo appuntamenti su WhatsApp e Google va ricollegato dalla pagina Impostazioni > Integrazioni.`,
+      );
+    }
+
     const report: WatchdogReport = {
       status,
       checkedAt: now.toISOString(),
@@ -202,6 +219,7 @@ export class HealthWatchdogService {
         calendarTerminalSyncs: calendar.terminalSyncs,
         calendarUrgentUnsynced: calendar.urgentUnsynced,
         calendarStaleSyncs: calendar.staleSyncs,
+        calendarAvailabilityBrokenIntegrations: calendar.availabilityBrokenIntegrations,
       },
       'Watchdog: coda in stato anomalo',
     );
@@ -223,7 +241,8 @@ export class HealthWatchdogService {
     const calendarAffected =
       report.calendar.terminalSyncs > 0 ||
       report.calendar.urgentUnsynced > 0 ||
-      report.calendar.staleSyncs > 0;
+      report.calendar.staleSyncs > 0 ||
+      report.calendar.availabilityBrokenIntegrations > 0;
     const subject = calendarAffected
       ? '[Ambrogio] Appuntamenti non sincronizzati con Google Calendar'
       : report.status === 'critical'
@@ -248,12 +267,18 @@ export class HealthWatchdogService {
       calendarAffected ? `Da inserire a mano: ${report.calendar.terminalSyncs}` : '',
       calendarAffected ? `Entro 24 ore, non sincronizzati: ${report.calendar.urgentUnsynced}` : '',
       calendarAffected ? `In attesa da troppo tempo: ${report.calendar.staleSyncs}` : '',
+      report.calendar.availabilityBrokenIntegrations > 0
+        ? `Integrazioni da ricollegare (disponibilita' non verificabile): ${report.calendar.availabilityBrokenIntegrations}`
+        : '',
       '',
       `Rilevazione: ${report.checkedAt}`,
       '',
       'Gli appuntamenti restano validi e visibili nella dashboard: manca solo la',
       'copia sul calendario Google. Il runbook con le query è in',
       'docs/runbook-calendar-sync.md.',
+      report.calendar.availabilityBrokenIntegrations > 0
+        ? "Per le integrazioni che non verificano piu' la disponibilita' il runbook è in docs/runbook-calendar-availability.md: la remediation è una riconnessione OAuth dal tenant."
+        : '',
       '',
       'Prima cosa da verificare: che i cron della piattaforma stiano effettivamente',
       'invocando /api/internal/jobs/whatsapp-outbox e',
@@ -336,7 +361,7 @@ class SupabaseWatchdogRepository implements WatchdogRepository {
     const nowIso = input.now.toISOString();
     const waiting = ['pending', 'failed'];
 
-    const [terminal, urgent, stale] = await Promise.all([
+    const [terminal, urgent, stale, availabilityBroken] = await Promise.all([
       this.supabase
         .from('appointments')
         .select('id', { count: 'exact', head: true })
@@ -361,9 +386,19 @@ class SupabaseWatchdogRepository implements WatchdogRepository {
         .lt('calendar_sync_next_attempt_at', input.staleBefore.toISOString())
         .lt('calendar_sync_attempts', CALENDAR_SYNC_MAX_ATTEMPTS)
         .gt('scheduled_at', nowIso),
+      // Conteggio cross-tenant, senza dati del tenant: al watchdog serve
+      // sapere QUANTE integrazioni sono da ricollegare, non quali clienti
+      // stiano scrivendo. Solo le `active` contano: una `revoked` e' stata
+      // staccata di proposito.
+      this.supabase
+        .from('integrations')
+        .select('id', { count: 'exact', head: true })
+        .eq('provider', 'google_calendar')
+        .eq('status', 'active')
+        .not('availability_error_at', 'is', null),
     ]);
 
-    const failure = terminal.error ?? urgent.error ?? stale.error;
+    const failure = terminal.error ?? urgent.error ?? stale.error ?? availabilityBroken.error;
 
     if (failure) {
       throw new AppError('internal', 'Failed to read calendar sync stats', { cause: failure });
@@ -373,6 +408,7 @@ class SupabaseWatchdogRepository implements WatchdogRepository {
       terminalSyncs: terminal.count ?? 0,
       urgentUnsynced: urgent.count ?? 0,
       staleSyncs: stale.count ?? 0,
+      availabilityBrokenIntegrations: availabilityBroken.count ?? 0,
     };
   }
 }

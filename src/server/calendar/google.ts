@@ -1,13 +1,17 @@
 import { env } from '@/lib/env';
 import { AppError } from '@/lib/errors/app-error';
+import { fetchWithTimeout } from '@/lib/http/fetch-with-timeout';
 import {
   parseGoogleCalendarEventResponse,
-  parseGoogleFreeBusyResponse,
   parseGoogleTokenResponse,
+  parseGoogleFreeBusyResponseStrict,
   type GoogleCalendarEventResponse,
-  type GoogleFreeBusyResponse,
   type GoogleOAuthTokenResponse,
 } from '@/lib/external-schemas/google';
+import {
+  CalendarAvailabilityUnavailable,
+  type CalendarAvailabilityFailureKind,
+} from '@/server/calendar/availability-error';
 import { readCredentialSecret } from '@/server/integrations/credential-encryption';
 
 export type CalendarBusyInterval = {
@@ -114,6 +118,23 @@ export class GoogleCalendarProvider {
     this.onTokenRefresh = options.onTokenRefresh;
   }
 
+  /**
+   * Confine di normalizzazione della DISPONIBILITA'.
+   *
+   * Tutto cio' che qui dentro puo' fallire in modo previsto — token, rete,
+   * HTTP, schema, calendario rifiutato, intervalli illeggibili — esce come
+   * `CalendarAvailabilityUnavailable`, cioe' "non lo so", mai come lista
+   * vuota. La lista vuota resta riservata all'unico caso in cui Google ha
+   * davvero risposto "questo calendario non ha impegni".
+   *
+   * La normalizzazione e' deliberatamente per-operazione e non un `catch`
+   * attorno al metodo: un `TypeError` nato da un difetto di questo file deve
+   * continuare a propagarsi tale e quale. Un bug di programmazione mascherato
+   * da "riprova piu' tardi" e' un bug che nessuno vedra' mai.
+   *
+   * Le scritture (`createEvent`/`updateEvent`/`cancelEvent`) NON passano di
+   * qui e mantengono la semantica di PILOT-P0-1 invariata.
+   */
   async listBusy(input: {
     integration: GoogleCalendarIntegration;
     from: Date;
@@ -121,45 +142,136 @@ export class GoogleCalendarProvider {
     timezone: string;
   }): Promise<CalendarBusyInterval[]> {
     const calendarId = calendarIdForIntegration(input.integration);
-    const accessToken = await this.getAccessToken(input.integration);
-    const response = await this.fetcher(`${this.apiBaseUrl}/freeBusy`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        timeMin: input.from.toISOString(),
-        timeMax: input.to.toISOString(),
-        timeZone: input.timezone,
-        items: [{ id: calendarId }],
-      }),
+    const accessToken = await this.acquireAvailabilityAccessToken(input.integration);
+    const response = await this.requestFreeBusy({
+      accessToken,
+      calendarId,
+      from: input.from,
+      to: input.to,
+      timezone: input.timezone,
     });
-    const rawBody = await readJson(response);
-    const body: GoogleFreeBusyResponse = parseGoogleFreeBusyResponse(rawBody);
+    const rawBody = await readAvailabilityBody(response);
 
+    // L'esito HTTP si classifica PRIMA di pretendere lo schema di successo:
+    // un 429 non e' una risposta malformata, e chiamarla tale perderebbe
+    // l'unica informazione che dice all'operatore cosa sta succedendo.
     if (!response.ok) {
-      throw googleCalendarError('Google Calendar freeBusy failed', response, rawBody);
+      throw availabilityErrorFromFreeBusyStatus(response.status, rawBody);
     }
 
-    const calendar = body.calendars?.[calendarId];
-    const firstError = calendar?.errors?.[0];
+    const parsed = parseGoogleFreeBusyResponseStrict(rawBody);
 
-    if (firstError) {
-      throw new AppError(
-        'upstream_error',
-        `Google Calendar freeBusy returned ${firstError.reason ?? 'error'}`,
-        { cause: firstError, expose: false },
+    if (!parsed.success) {
+      throw new CalendarAvailabilityUnavailable(
+        'Google Calendar freeBusy returned an unreadable response',
+        {
+          kind: 'invalid_response',
+          httpStatus: response.status,
+          reason: 'freebusy_schema_invalid',
+          cause: { issue: parsed.issue },
+        },
       );
     }
 
-    return (calendar?.busy ?? [])
-      .map((interval) => ({
-        start: parseGoogleDate(interval.start),
-        end: parseGoogleDate(interval.end),
-        source: 'google_calendar' as const,
-      }))
-      .filter((interval) => interval.start < interval.end);
+    const calendar = parsed.data.calendars[calendarId];
+
+    // Chiave assente: Google non ha detto "libero", non ha detto niente del
+    // calendario che abbiamo chiesto.
+    if (!calendar) {
+      throw new CalendarAvailabilityUnavailable(
+        'Google Calendar freeBusy omitted the requested calendar',
+        {
+          kind: 'invalid_response',
+          httpStatus: response.status,
+          reason: 'freebusy_calendar_missing',
+        },
+      );
+    }
+
+    const firstError = calendar.errors?.[0];
+
+    if (firstError) {
+      throw new CalendarAvailabilityUnavailable(
+        `Google Calendar freeBusy rejected the calendar (${firstError.reason ?? 'error'})`,
+        {
+          kind: 'provider_rejected',
+          httpStatus: response.status,
+          reason: `freebusy_calendar_error:${firstError.reason ?? 'unknown'}`,
+        },
+      );
+    }
+
+    return (calendar.busy ?? []).map((interval) =>
+      toAvailabilityBusyInterval(interval, response.status),
+    );
+  }
+
+  /**
+   * Acquisizione del token DENTRO il perimetro disponibilita'.
+   *
+   * `getAccessToken` resta condiviso con le scritture: qui si aggiungono solo
+   * il budget di rete e la traduzione dell'esito, e solo per questa chiamata.
+   */
+  private async acquireAvailabilityAccessToken(
+    integration: GoogleCalendarIntegration,
+  ): Promise<string> {
+    try {
+      return await this.getAccessToken(integration, { network: AVAILABILITY_NETWORK });
+    } catch (error) {
+      // Solo gli AppError sono guasti PREVISTI delle dipendenze note
+      // (credenziali, refresh HTTP, persistenza del token). Qualunque altra
+      // eccezione e' un difetto e resta tale.
+      if (error instanceof AppError) {
+        throw availabilityErrorFromTokenFailure(error);
+      }
+
+      throw error;
+    }
+  }
+
+  private async requestFreeBusy(input: {
+    accessToken: string;
+    calendarId: string;
+    from: Date;
+    to: Date;
+    timezone: string;
+  }): Promise<Response> {
+    try {
+      // `fetchWithTimeout` converte timeout e guasti di rete in AppError:
+      // qui resta solo da dargli l'identita' di errore di disponibilita'.
+      return await fetchWithTimeout(
+        `${this.apiBaseUrl}/freeBusy`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${input.accessToken}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            timeMin: input.from.toISOString(),
+            timeMax: input.to.toISOString(),
+            timeZone: input.timezone,
+            items: [{ id: input.calendarId }],
+          }),
+        },
+        {
+          timeoutMs: AVAILABILITY_NETWORK.timeoutMs,
+          retries: 0,
+          fetchImpl: this.fetcher,
+          label: 'Google Calendar freeBusy',
+        },
+      );
+    } catch (error) {
+      if (error instanceof AppError) {
+        throw new CalendarAvailabilityUnavailable('Google Calendar freeBusy could not be reached', {
+          kind: 'transient',
+          reason: 'freebusy_transport_failure',
+          cause: error,
+        });
+      }
+
+      throw error;
+    }
   }
 
   /**
@@ -331,7 +443,18 @@ export class GoogleCalendarProvider {
     throw googleCalendarError('Google Calendar event delete failed', response, body);
   }
 
-  private async getAccessToken(integration: GoogleCalendarIntegration): Promise<string> {
+  /**
+   * Condiviso fra disponibilita' e scritture.
+   *
+   * `options.network` e' passato SOLO dal percorso disponibilita': senza,
+   * la chiamata di refresh resta identica a PILOT-P0-1 (nessun timeout
+   * aggiuntivo, nessuna riclassificazione). Il budget di rete della
+   * disponibilita' non deve poter accorciare una scrittura di calendario.
+   */
+  private async getAccessToken(
+    integration: GoogleCalendarIntegration,
+    options: { network?: AvailabilityNetworkPolicy } = {},
+  ): Promise<string> {
     const accessToken = readCredentialSecret(integration.credentials, 'access_token');
     const expiresAt = numberFromRecord(integration.credentials, 'expires_at');
     const expiresAtMs = expiresAt ? expiresAt * (expiresAt > 10_000_000_000 ? 1 : 1000) : null;
@@ -346,7 +469,7 @@ export class GoogleCalendarProvider {
       throw new AppError(
         'upstream_error',
         'Google Calendar credentials are missing access_token or refresh_token',
-        { expose: false },
+        { expose: false, cause: { [GOOGLE_AUTH_FAILURE]: 'missing_credentials' } },
       );
     }
 
@@ -356,7 +479,7 @@ export class GoogleCalendarProvider {
       });
     }
 
-    const response = await this.fetcher(this.tokenUrl, {
+    const tokenRequest: RequestInit = {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -365,8 +488,18 @@ export class GoogleCalendarProvider {
         refresh_token: refreshToken,
         grant_type: 'refresh_token',
       }).toString(),
-    });
-    const rawBody = await readJson(response);
+    };
+    const response = options.network
+      ? await fetchWithTimeout(this.tokenUrl, tokenRequest, {
+          timeoutMs: options.network.timeoutMs,
+          retries: 0,
+          fetchImpl: this.fetcher,
+          label: 'Google OAuth token refresh',
+        })
+      : await this.fetcher(this.tokenUrl, tokenRequest);
+    const rawBody = options.network
+      ? await readAvailabilityBody(response)
+      : await readJson(response);
     const body: GoogleOAuthTokenResponse = parseGoogleTokenResponse(rawBody);
 
     if (!response.ok || !body.access_token) {
@@ -383,6 +516,189 @@ export class GoogleCalendarProvider {
 
     return body.access_token;
   }
+}
+
+/**
+ * Budget di rete della DISPONIBILITA'.
+ *
+ * 3 secondi e zero retry automatici. Il turno WhatsApp ha un tetto imposto da
+ * Meta e il cliente sta aspettando: una risposta deterministica "riprova fra
+ * poco" arrivata in tempo vale piu' di una risposta perfetta arrivata dopo che
+ * il webhook e' scaduto. Il ritentativo e' un gesto esplicito del cliente, non
+ * un ciclo nascosto dentro il turno.
+ *
+ * Vale SOLO per le chiamate fatte da `listBusy`. Le scritture di calendario di
+ * PILOT-P0-1 conservano il timeout di default.
+ */
+type AvailabilityNetworkPolicy = { timeoutMs: number };
+
+const AVAILABILITY_NETWORK: AvailabilityNetworkPolicy = { timeoutMs: 3_000 };
+
+/**
+ * Marcatore sulla `cause` dei guasti di credenziali.
+ *
+ * Serve a classificare senza leggere il messaggio dell'errore: un match sul
+ * testo si rompe alla prima riformulazione, e qui il testo decide se un
+ * operatore verra' svegliato.
+ */
+const GOOGLE_AUTH_FAILURE = 'googleAuthFailure';
+
+/**
+ * Traduce un guasto HTTP di freeBusy in un esito di disponibilita'.
+ *
+ * 401 e' l'unico status che da solo dimostra credenziali rotte. Il 403 di
+ * Google copre anche quota superata e rate limit di progetto: trattarlo come
+ * rottura permanente marcherebbe come "da ricollegare" integrazioni
+ * perfettamente sane.
+ */
+function availabilityErrorFromFreeBusyStatus(
+  status: number,
+  rawBody: unknown,
+): CalendarAvailabilityUnavailable {
+  const kind: CalendarAvailabilityFailureKind =
+    status === 401
+      ? 'auth'
+      : status === 403 || status === 429 || status >= 500
+        ? 'transient'
+        : 'provider_rejected';
+
+  return new CalendarAvailabilityUnavailable(`Google Calendar freeBusy failed (${status})`, {
+    kind,
+    httpStatus: status,
+    reason: `freebusy_http_${status}`,
+    cause: { status, googleError: googleErrorCode(rawBody) },
+  });
+}
+
+/**
+ * Traduce un guasto di acquisizione token in un esito di disponibilita'.
+ *
+ * `invalid_grant` viene letto dal body GREZZO e non dal parse lenient: quel
+ * parser, davanti a una risposta che non riconosce, ritorna `{}` — e `{}` non
+ * contiene `invalid_grant`, quindi una revoca del consenso passerebbe per un
+ * guasto passeggero e nessuno chiederebbe mai al tenant di ricollegare Google.
+ */
+function availabilityErrorFromTokenFailure(error: AppError): CalendarAvailabilityUnavailable {
+  const cause = plainRecord(error.cause);
+
+  if (cause?.[GOOGLE_AUTH_FAILURE] === 'missing_credentials') {
+    return new CalendarAvailabilityUnavailable(
+      'Google Calendar availability has no usable stored credentials',
+      { kind: 'auth', reason: 'missing_credentials', cause: error },
+    );
+  }
+
+  // Configurazione applicativa mancante: il turno degrada in modo
+  // deterministico, ma l'integrazione del tenant non e' rotta e non deve
+  // finire sotto il watchdog come "da ricollegare".
+  if (error.code === 'internal') {
+    return new CalendarAvailabilityUnavailable(
+      'Google Calendar availability is not configured on this deployment',
+      { kind: 'configuration', reason: 'oauth_client_not_configured', cause: error },
+    );
+  }
+
+  const status = typeof cause?.status === 'number' ? cause.status : null;
+  const googleError = googleErrorCode(cause?.body);
+
+  if (googleError === 'invalid_grant' || status === 401) {
+    return new CalendarAvailabilityUnavailable('Google Calendar refresh token is no longer valid', {
+      kind: 'auth',
+      httpStatus: status,
+      reason: googleError === 'invalid_grant' ? 'invalid_grant' : 'token_refresh_unauthorized',
+      cause: { status },
+    });
+  }
+
+  if (status !== null && status !== 403 && status !== 429 && status < 500) {
+    return new CalendarAvailabilityUnavailable(
+      `Google Calendar token refresh was rejected (${status})`,
+      { kind: 'provider_rejected', httpStatus: status, reason: `token_refresh_http_${status}` },
+    );
+  }
+
+  // Resto: trasporto, 403/429/5xx, e i guasti del repository incontrati
+  // mentre si persisteva il token rinfrescato. Nessuno di questi dimostra
+  // che l'integrazione sia rotta.
+  return new CalendarAvailabilityUnavailable(
+    'Google Calendar availability could not acquire an access token',
+    {
+      kind: 'transient',
+      httpStatus: status,
+      reason: status === null ? 'token_acquisition_failed' : `token_refresh_http_${status}`,
+      cause: error,
+    },
+  );
+}
+
+/**
+ * Un intervallo busy che non sappiamo leggere non e' un intervallo da
+ * scartare: scartarlo significa dichiarare libero un tempo che Google aveva
+ * dichiarato occupato.
+ */
+function toAvailabilityBusyInterval(
+  interval: { start: string; end: string },
+  httpStatus: number,
+): CalendarBusyInterval {
+  const start = new Date(interval.start);
+  const end = new Date(interval.end);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) {
+    throw new CalendarAvailabilityUnavailable(
+      'Google Calendar freeBusy returned an unreadable busy interval',
+      {
+        kind: 'invalid_response',
+        httpStatus,
+        reason: 'freebusy_interval_invalid',
+      },
+    );
+  }
+
+  return { start, end, source: 'google_calendar' };
+}
+
+/**
+ * Lettura del corpo della risposta sul percorso disponibilita'.
+ *
+ * `response.text()` puo' fallire a stream interrotto: e' un guasto esterno
+ * previsto di QUESTA operazione, non un difetto del codice, quindi viene
+ * normalizzato qui e non piu' in alto.
+ */
+async function readAvailabilityBody(response: Response): Promise<unknown> {
+  try {
+    return await readJson(response);
+  } catch (error) {
+    throw new CalendarAvailabilityUnavailable('Google Calendar response body could not be read', {
+      kind: 'transient',
+      httpStatus: response.status,
+      reason: 'response_body_unreadable',
+      cause: error,
+    });
+  }
+}
+
+/** Legge `error` (OAuth) o `error.status`/`error.errors[].reason` (Calendar). */
+function googleErrorCode(body: unknown): string | null {
+  const record = plainRecord(body);
+
+  if (!record) {
+    return null;
+  }
+
+  if (typeof record.error === 'string' && record.error.trim()) {
+    return record.error.trim();
+  }
+
+  const nested = plainRecord(record.error);
+  const reason = Array.isArray(nested?.errors) ? plainRecord(nested.errors[0])?.reason : null;
+
+  return typeof reason === 'string' && reason.trim() ? reason.trim() : null;
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function googleCalendarEventBody(input: GoogleCalendarEventInput): Record<string, unknown> {
@@ -447,8 +763,8 @@ function attendeeList(
 }
 
 /**
- * Variante non fatale di `parseGoogleDate`: un estremo assente o all-day
- * diventa `null`, che la convergenza legge come divergenza.
+ * Estremo temporale opzionale: un estremo assente o all-day diventa `null`,
+ * che la convergenza legge come divergenza.
  */
 function optionalGoogleDate(value: string | undefined): Date | null {
   if (!value) {
@@ -458,23 +774,6 @@ function optionalGoogleDate(value: string | undefined): Date | null {
   const date = new Date(value);
 
   return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function parseGoogleDate(value: string | undefined): Date {
-  if (!value) {
-    throw new AppError('upstream_error', 'Google Calendar returned an empty date');
-  }
-
-  const date = new Date(value);
-
-  if (Number.isNaN(date.getTime())) {
-    throw new AppError('upstream_error', 'Google Calendar returned invalid date', {
-      cause: value,
-      expose: false,
-    });
-  }
-
-  return date;
 }
 
 async function readJson(response: Response): Promise<unknown> {

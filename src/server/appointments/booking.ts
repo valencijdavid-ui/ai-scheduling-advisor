@@ -9,6 +9,11 @@ import {
   type GoogleCalendarIntegration,
 } from '@/server/calendar/google';
 import {
+  AVAILABILITY_AUTH_ERROR_CODE,
+  isCalendarAvailabilityUnavailable,
+  type CalendarAvailabilityUnavailable,
+} from '@/server/calendar/availability-error';
+import {
   CALENDAR_SYNC_MAX_ATTEMPTS,
   calculateCalendarSyncNextAttemptAt,
   convergeCalendarEvent,
@@ -51,6 +56,14 @@ export type BookingServiceContext = {
   };
   businessHours: BusinessHourWindow[];
   googleCalendarIntegration: GoogleCalendarIntegration | null;
+  /**
+   * Codice di guasto permanente gia' registrato sull'integrazione, se c'e'.
+   *
+   * Serve a una cosa sola: sapere se una verifica riuscita ha qualcosa da
+   * cancellare. Senza, ogni turno andato a buon fine scriverebbe una UPDATE
+   * su `integrations` per azzerare due colonne gia' nulle.
+   */
+  googleAvailabilityErrorCode: string | null;
 };
 
 export type BusinessHourWindow = {
@@ -183,6 +196,21 @@ export type AppointmentBookingRepository = {
     scope: string | null;
     tokenType: string | null;
   }): Promise<void>;
+  /**
+   * Marca l'integrazione come non verificabile in modo permanente.
+   *
+   * Scrive due colonne di health e NON tocca `integrations.status`: lo stato
+   * `active` e' il criterio con cui PILOT-P0-1 seleziona l'integrazione per
+   * riconciliare gli eventi gia' promessi al cliente, e un guasto di lettura
+   * non deve poter spegnere la convergenza delle scritture.
+   */
+  markGoogleAvailabilityError(input: {
+    tenantId: string;
+    integrationId: string;
+    errorCode: string;
+    occurredAt: Date;
+  }): Promise<void>;
+  clearGoogleAvailabilityError(input: { tenantId: string; integrationId: string }): Promise<void>;
   getAppointmentForChange(input: {
     tenantId: string;
     appointmentId: string;
@@ -312,6 +340,8 @@ type IntegrationRow = {
   external_account_id: string | null;
   credentials: unknown;
   config: unknown;
+  availability_error_code: string | null;
+  availability_error_at: string | null;
 };
 
 type AppointmentBusyRow = {
@@ -379,12 +409,15 @@ export class AppointmentBookingService {
         ? { excludeAppointmentId: input.excludeAppointmentId }
         : {}),
     });
+    // Nessuna integrazione Google: la disponibilita' e' quella di Postgres, ed
+    // e' un caso corretto e voluto. E' strutturalmente diverso da "Google
+    // esiste ma non risponde", che non puo' mai produrre una lista.
     const googleBusy = context.googleCalendarIntegration
-      ? await this.calendarProvider.listBusy({
+      ? await this.readVerifiedGoogleBusy({
+          context,
           integration: context.googleCalendarIntegration,
           from: earliestStart,
           to,
-          timezone: context.timezone,
         })
       : [];
 
@@ -902,6 +935,134 @@ export class AppointmentBookingService {
     }
   }
 
+  /**
+   * Legge le fasce occupate da Google, oppure fallisce.
+   *
+   * Non esiste un terzo esito. Il `catch` qui non serve a recuperare: serve a
+   * registrare la salute dell'integrazione e a ri-lanciare. Se restituisse
+   * `[]` — o le sole fasce locali — trasformerebbe "non lo so" in "libero", e
+   * ogni strato sopra di qui prenoterebbe sopra impegni reali senza mai
+   * accorgersene.
+   */
+  private async readVerifiedGoogleBusy(input: {
+    context: BookingServiceContext;
+    integration: GoogleCalendarIntegration;
+    from: Date;
+    to: Date;
+  }): Promise<CalendarBusyInterval[]> {
+    let busy: CalendarBusyInterval[];
+
+    try {
+      busy = await this.calendarProvider.listBusy({
+        integration: input.integration,
+        from: input.from,
+        to: input.to,
+        timezone: input.context.timezone,
+      });
+    } catch (error) {
+      if (isCalendarAvailabilityUnavailable(error)) {
+        await this.recordAvailabilityFailure(input.integration, error);
+      }
+
+      // Qualunque errore risale, tipizzato o no: il servizio non ha mai il
+      // permesso di rispondere "libero" a una domanda a cui non ha risposta.
+      throw error;
+    }
+
+    await this.clearAvailabilityHealthIfMarked(input.context, input.integration);
+
+    return busy;
+  }
+
+  /**
+   * Un evento di log stabile per ogni guasto tipizzato, piu' l'eventuale
+   * marcatura permanente.
+   *
+   * Nel log non entrano ne' il cliente ne' il corpo grezzo di Google: la
+   * riga deve poter essere letta da un operatore senza esporre dati
+   * personali e senza rischiare che ci finisca dentro un token.
+   */
+  private async recordAvailabilityFailure(
+    integration: GoogleCalendarIntegration,
+    error: CalendarAvailabilityUnavailable,
+  ): Promise<void> {
+    logger.error(
+      {
+        tenantId: integration.tenantId,
+        integrationId: integration.id,
+        kind: error.kind,
+        httpStatus: error.httpStatus,
+        reason: error.reason,
+      },
+      'calendar_availability_unavailable',
+    );
+
+    // Solo i guasti che dicono qualcosa sull'INTEGRAZIONE diventano
+    // permanenti. Un 429 o un timeout descrivono Google in questo istante, non
+    // il tenant: marcarli riempirebbe il watchdog di allarmi che si risolvono
+    // da soli e lo renderebbe ignorabile.
+    if (!error.isPermanentIntegrationAuthFailure) {
+      return;
+    }
+
+    try {
+      await this.repository.markGoogleAvailabilityError({
+        tenantId: integration.tenantId,
+        integrationId: integration.id,
+        errorCode: AVAILABILITY_AUTH_ERROR_CODE,
+        occurredAt: new Date(),
+      });
+    } catch (healthError) {
+      // La scrittura di health e' osservabilita', non parte dell'esito. Se
+      // fallisce, il cliente deve comunque ricevere la degradazione
+      // deterministica: sostituire l'errore originale con questo perderebbe
+      // la ragione vera del guasto.
+      logger.error(
+        {
+          err: healthError,
+          tenantId: integration.tenantId,
+          integrationId: integration.id,
+        },
+        'Failed to persist Google Calendar availability health marker',
+      );
+    }
+  }
+
+  /**
+   * Una verifica riuscita cancella un marcatore esistente, e solo quello.
+   *
+   * La condizione sul codice gia' presente evita una UPDATE su `integrations`
+   * a ogni turno andato bene: sarebbe una scrittura per ogni messaggio di
+   * prenotazione, su una tabella che non ha ragione di essere toccata.
+   */
+  private async clearAvailabilityHealthIfMarked(
+    context: BookingServiceContext,
+    integration: GoogleCalendarIntegration,
+  ): Promise<void> {
+    if (!context.googleAvailabilityErrorCode) {
+      return;
+    }
+
+    try {
+      await this.repository.clearGoogleAvailabilityError({
+        tenantId: integration.tenantId,
+        integrationId: integration.id,
+      });
+    } catch (error) {
+      // Una disponibilita' verificata resta valida anche se non riusciamo a
+      // cancellare il marcatore: il peggio che accade e' un allarme che
+      // sopravvive un giro di troppo.
+      logger.warn(
+        {
+          err: error,
+          tenantId: integration.tenantId,
+          integrationId: integration.id,
+        },
+        'Failed to clear Google Calendar availability health marker',
+      );
+    }
+  }
+
   private async getRequiredContext(input: {
     tenantId: string;
     serviceId: string;
@@ -995,7 +1156,9 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
 
     const integrations = await this.supabase
       .from('integrations')
-      .select('id, tenant_id, external_account_id, credentials, config')
+      .select(
+        'id, tenant_id, external_account_id, credentials, config, availability_error_code, availability_error_at',
+      )
       .eq('tenant_id', input.tenantId)
       .eq('provider', 'google_calendar')
       .eq('status', 'active')
@@ -1039,7 +1202,50 @@ export class SupabaseAppointmentBookingRepository implements AppointmentBookingR
             config: toPlainRecord(integrationRow.config),
           }
         : null,
+      googleAvailabilityErrorCode: integrationRow?.availability_error_code ?? null,
     };
+  }
+
+  async markGoogleAvailabilityError(input: {
+    tenantId: string;
+    integrationId: string;
+    errorCode: string;
+    occurredAt: Date;
+  }): Promise<void> {
+    // `status` resta fuori dall'UPDATE di proposito: vedi
+    // 202608240003_calendar_availability_health.sql.
+    const { error } = await this.supabase
+      .from('integrations')
+      .update({
+        availability_error_code: input.errorCode,
+        availability_error_at: input.occurredAt.toISOString(),
+      })
+      .eq('tenant_id', input.tenantId)
+      .eq('id', input.integrationId)
+      .eq('provider', 'google_calendar');
+
+    if (error) {
+      throw toRepositoryError('Failed to mark Google Calendar availability error', error);
+    }
+  }
+
+  async clearGoogleAvailabilityError(input: {
+    tenantId: string;
+    integrationId: string;
+  }): Promise<void> {
+    const { error } = await this.supabase
+      .from('integrations')
+      .update({
+        availability_error_code: null,
+        availability_error_at: null,
+      })
+      .eq('tenant_id', input.tenantId)
+      .eq('id', input.integrationId)
+      .eq('provider', 'google_calendar');
+
+    if (error) {
+      throw toRepositoryError('Failed to clear Google Calendar availability error', error);
+    }
   }
 
   async listLocalBusyIntervals(input: {

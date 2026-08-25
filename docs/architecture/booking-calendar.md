@@ -76,6 +76,50 @@ Regole applicate:
 - se `integrations.provider='google_calendar'` e `status='active'`, esclude anche i busy intervals Google Calendar;
 - ritorna max slot configurabile, default 5.
 
+### Fail-closed della verifica Google (PILOT-P0-2)
+
+Per un tenant con Google Calendar collegato, la disponibilita' esiste **solo se
+`freeBusy` e' stata verificata**. Uno stato non verificabile non diventa mai
+`libero`, `[]`, "non ci sono slot", o una prenotazione solo-Postgres: assenza di
+prova non e' prova di assenza.
+
+Restano due stati strutturalmente distinti:
+
+| Stato | Comportamento |
+|---|---|
+| Nessuna integrazione Google | Disponibilita' da Postgres. Invariato. |
+| Google collegato, non verificabile | Nessuna disponibilita'. Errore tipizzato. |
+
+- **Confine di normalizzazione:** `GoogleCalendarProvider.listBusy`. I guasti
+  *previsti* delle sue dipendenze (token, rete, HTTP, schema, calendario
+  rifiutato, intervalli illeggibili) diventano `CalendarAvailabilityUnavailable`
+  (`AppError('upstream_error')`). Un difetto di programmazione — un `TypeError` —
+  propaga inalterato. Le scritture di calendario (PILOT-P0-1) non passano di qui
+  e mantengono la semantica invariata.
+- **Parsing stretto:** solo per `freeBusy`, e solo sulle risposte HTTP di
+  successo. Lo stato HTTP viene classificato *prima* di pretendere lo schema.
+  L'unico caso "vuoto" legittimo e' un calendario valido con `busy: []`.
+- **Budget di rete:** 3s e zero retry automatici per `freeBusy` e per il refresh
+  OAuth *innescato da* `listBusy`. Il ritentativo e' un gesto esplicito del
+  cliente, non un ciclo dentro il turno WhatsApp.
+- **Servizio fail-closed:** `getAvailableSlots` propaga. Quindi una revalidation
+  fallita in `createAppointment` inserisce zero appuntamenti, e in
+  `rescheduleAppointment` lascia l'orario esistente invariato.
+- **Prodotto:** i quattro confini (scoperta e conferma, prenotazione e
+  spostamento) rispondono `handled: true` con testo deterministico costante, mai
+  `handled: false` — che ricadrebbe sul piano di risposta del modello. Il
+  conflitto genuino resta trattato per primo e resta distinto. Nessuno stato di
+  conversazione viene cancellato e nessuna `expiresAt` viene toccata.
+- **Salute permanente:** solo i guasti auth specifici dell'integrazione scrivono
+  `integrations.availability_error_code` / `availability_error_at`.
+  `integrations.status` non viene mai toccato. Riconnessione e disconnessione
+  OAuth azzerano entrambe le colonne nella stessa mutazione.
+- **Operatore:** il watchdog conta le integrazioni marcate. Runbook in
+  [`docs/runbook-calendar-availability.md`](../runbook-calendar-availability.md).
+
+PILOT-P0-2 **non** fornisce disponibilita' durante un'indisponibilita' totale di
+Google: niente cache, niente fallback su dati vecchi, niente circuit breaker.
+
 ## Creazione Appuntamento
 
 `createAppointment()`:
@@ -200,6 +244,7 @@ Il constraint impedisce overlap tra appointment `confirmed` dello stesso tenant 
 ## Limiti Noti
 
 - Non ci sono ancora chiusure straordinarie/ferie.
+- Durante un'indisponibilita' totale di Google, un tenant integrato non prende appuntamenti via WhatsApp: risponde in modo deterministico e il cliente ritenta.
 - L'estrattore booking e' rule-based: copre preferenze comuni in italiano e ha fixture eval deterministic, ma non usa ancora un adapter AI strutturato per frasi molto complesse o ambigue.
 - Le route OAuth richiedono sessione Supabase e claim tenant/role gia' configurati.
 

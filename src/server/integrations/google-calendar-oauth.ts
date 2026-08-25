@@ -387,6 +387,13 @@ export class SupabaseGoogleCalendarOAuthRepository implements GoogleCalendarOAut
       config: input.config,
       last_sync_at: input.connectedAt.toISOString(),
       updated_at: input.connectedAt.toISOString(),
+      // La salute della verifica di disponibilita' si azzera nella STESSA
+      // mutazione che ripristina le credenziali. Separarle lascerebbe una
+      // finestra in cui l'integrazione e' gia' riconnessa e il watchdog la
+      // considera ancora da riconnettere: l'operatore rifarebbe un lavoro
+      // gia' fatto.
+      availability_error_code: null,
+      availability_error_at: null,
     };
 
     const query = existing
@@ -424,6 +431,11 @@ export class SupabaseGoogleCalendarOAuthRepository implements GoogleCalendarOAut
           disconnected_at: input.disconnectedAt.toISOString(),
         },
         updated_at: input.disconnectedAt.toISOString(),
+        // Un'integrazione rimossa di proposito non e' un guasto da sorvegliare:
+        // lasciarla marcata terrebbe acceso un allarme che nessuno puo' piu'
+        // risolvere, perche' non c'e' piu' niente da ricollegare.
+        availability_error_code: null,
+        availability_error_at: null,
       })
       .eq('tenant_id', input.tenantId)
       .eq('id', input.integrationId)

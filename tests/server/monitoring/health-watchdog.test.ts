@@ -27,6 +27,7 @@ function repositoryReturning(
     async readCalendarSyncStats() {
       return {
         terminalSyncs: 0,
+        availabilityBrokenIntegrations: 0,
         urgentUnsynced: 0,
         staleSyncs: 0,
         ...calendar,
@@ -171,6 +172,24 @@ describe('HealthWatchdogService', () => {
     expect(report.reasons.join(' ')).toContain('24 ore');
   });
 
+  it("rende visibile un'integrazione Google che non verifica piu' la disponibilita'", async () => {
+    // PILOT-P0-2: e' una condizione PERMANENTE, e il sintomo che l'operatore
+    // vede da fuori — un numero che smette di prendere appuntamenti — e'
+    // identico a una giornata tranquilla. Senza questo conteggio il guasto e'
+    // invisibile per costruzione.
+    const sender = recordingSender();
+    const report = await makeService(
+      repositoryReturning({}, { availabilityBrokenIntegrations: 3 }),
+      sender,
+    ).check();
+
+    expect(report.status).toBe('critical');
+    expect(report.calendar.availabilityBrokenIntegrations).toBe(3);
+    // L'operatore deve capire dalla riga stessa qual e' la remediation.
+    expect(report.reasons.join(' ')).toContain('ricollegato');
+    expect(sender.sent[0]?.text).toContain('runbook-calendar-availability.md');
+  });
+
   it('rileva il reconciler del calendario fermo', async () => {
     const sender = recordingSender();
     const report = await makeService(repositoryReturning({}, { staleSyncs: 5 }), sender).check();
@@ -186,7 +205,12 @@ describe('HealthWatchdogService', () => {
     const report = await makeService(repositoryReturning({}), sender).check();
 
     expect(report.status).toBe('ok');
-    expect(report.calendar).toEqual({ terminalSyncs: 0, urgentUnsynced: 0, staleSyncs: 0 });
+    expect(report.calendar).toEqual({
+      terminalSyncs: 0,
+      urgentUnsynced: 0,
+      staleSyncs: 0,
+      availabilityBrokenIntegrations: 0,
+    });
     expect(sender.sent).toEqual([]);
   });
 
@@ -198,7 +222,12 @@ describe('HealthWatchdogService', () => {
       },
       async readCalendarSyncStats(input) {
         urgentBefore.push(input.urgentBefore);
-        return { terminalSyncs: 0, urgentUnsynced: 0, staleSyncs: 0 };
+        return {
+          terminalSyncs: 0,
+          urgentUnsynced: 0,
+          staleSyncs: 0,
+          availabilityBrokenIntegrations: 0,
+        };
       },
     };
 
@@ -215,7 +244,12 @@ describe('HealthWatchdogService', () => {
         return { pendingJobs: 0, staleJobs: 0, deadLetterJobs: 0, oldestPendingAt: null };
       },
       async readCalendarSyncStats() {
-        return { terminalSyncs: 0, urgentUnsynced: 0, staleSyncs: 0 };
+        return {
+          terminalSyncs: 0,
+          urgentUnsynced: 0,
+          staleSyncs: 0,
+          availabilityBrokenIntegrations: 0,
+        };
       },
     };
 

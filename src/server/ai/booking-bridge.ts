@@ -17,6 +17,10 @@ import {
   type CancelAppointmentInput,
 } from '@/server/appointments/booking';
 import {
+  isCalendarAvailabilityUnavailable,
+  type CalendarAvailabilityUnavailable,
+} from '@/server/calendar/availability-error';
+import {
   createSchedulingDecisionLedger,
   toDecisionCandidates,
   type SchedulingDecisionLedger,
@@ -44,6 +48,31 @@ export type BookingBridgeReply = {
   replyText: string | null;
   metadata: Record<string, unknown>;
 };
+
+/**
+ * Le due risposte di degradazione della disponibilita' (PILOT-P0-2).
+ *
+ * Sono costanti, e devono restarlo. `handled: false` farebbe ricadere il turno
+ * sul piano di risposta generato dal modello, che di fronte a un guasto del
+ * calendario non ha modo di sapere che il calendario e' guasto: proporrebbe
+ * orari inventati con lo stesso tono sicuro di quelli veri. Una risposta
+ * deterministica dice l'unica cosa vera che sappiamo — "adesso non lo so" — e
+ * lascia al cliente il gesto esplicito del ritentativo.
+ *
+ * Nessuna delle due dice che il team e' stato avvisato: nessuna notifica viene
+ * inviata su questo percorso, e promettere un intervento che non parte e' peggio
+ * che non prometterlo.
+ */
+export const AVAILABILITY_UNVERIFIABLE_REPLY =
+  'Non riesco a controllare il calendario in questo momento, quindi non posso proporti orari senza rischiare di sbagliare. Riprova fra qualche minuto e ricontrollo subito.';
+
+/**
+ * Il cliente ha gia' scelto uno slot: qui la cosa importante da dire e' che la
+ * scelta NON e' andata persa. Lo stato della proposta e la sua scadenza
+ * restano intatti, quindi "confermo" continua a essere la risposta giusta.
+ */
+export const AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY =
+  'Non riesco a confermare adesso perche non riesco a controllare il calendario. Non ho prenotato niente e non ho perso la tua scelta: riscrivimi "confermo" fra qualche minuto e completo io.';
 
 export type BookingServiceOption = {
   id: string;
@@ -255,14 +284,32 @@ export class BookingBridgeService {
     }
 
     const availabilityWindow = availabilityWindowForRequest(extracted, input.occurredAt);
-    const rawSlots = await this.bookingService.getAvailableSlots({
-      tenantId: input.tenantId,
-      serviceId: service.id,
-      from: availabilityWindow.from,
-      to: availabilityWindow.to,
-      now: input.occurredAt,
-      maxSlots: shouldOverfetchForTimePreference(extracted) ? 20 : 3,
-    });
+    let rawSlots: BookingSlot[];
+
+    try {
+      rawSlots = await this.bookingService.getAvailableSlots({
+        tenantId: input.tenantId,
+        serviceId: service.id,
+        from: availabilityWindow.from,
+        to: availabilityWindow.to,
+        now: input.occurredAt,
+        maxSlots: shouldOverfetchForTimePreference(extracted) ? 20 : 3,
+      });
+    } catch (error) {
+      // Il ritorno avviene PRIMA di filtrare e prima del ramo "nessuno slot":
+      // quel ramo afferma che la disponibilita' e' stata verificata e non ha
+      // prodotto orari, ed e' un'affermazione che qui non possiamo fare.
+      // Nessuno stato viene toccato: non c'e' niente di nuovo da ricordare.
+      if (isCalendarAvailabilityUnavailable(error)) {
+        return availabilityDegradedReply(AVAILABILITY_UNVERIFIABLE_REPLY, error, {
+          action: 'availability_unverifiable',
+          serviceId: service.id,
+        });
+      }
+
+      throw error;
+    }
+
     const candidates = filterSlotsByBookingRequest(rawSlots, extracted);
     const ranked = this.rankingEnabled
       ? rankSlots({ slots: candidates, request: extracted, now: input.occurredAt })
@@ -427,6 +474,10 @@ export class BookingBridgeService {
         },
       };
     } catch (error) {
+      // Il conflitto viene per primo e resta invariato: e' l'esito in cui la
+      // disponibilita' E' stata verificata e lo slot risulta occupato. Se
+      // venisse dopo, un guasto del provider potrebbe essere raccontato al
+      // cliente come "slot preso da qualcun altro", che e' falso.
       if (error instanceof AppError && error.code === 'conflict') {
         await this.repository.clearConversationBookingState({
           tenantId: input.tenantId,
@@ -444,6 +495,17 @@ export class BookingBridgeService {
             },
           },
         };
+      }
+
+      // Nessuna `clearConversationBookingState` e nessuna nuova scadenza: la
+      // proposta e il suo `expiresAt` originale restano quelli, cosi' il
+      // ritentativo del cliente riparte da dove si era fermato invece di
+      // ricominciare la ricerca da capo.
+      if (isCalendarAvailabilityUnavailable(error)) {
+        return availabilityDegradedReply(AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY, error, {
+          action: 'availability_unverifiable_confirmation',
+          serviceId: slot.serviceId,
+        });
       }
 
       throw error;
@@ -770,16 +832,34 @@ export class BookingBridgeService {
     }
 
     const availabilityWindow = availabilityWindowForRequest(extracted, input.occurredAt);
-    const rawSlots = await this.bookingService.getAvailableSlots({
-      tenantId: input.tenantId,
-      serviceId: appointment.serviceId,
-      from: availabilityWindow.from,
-      to: availabilityWindow.to,
-      now: input.occurredAt,
-      maxSlots: shouldOverfetchForTimePreference(extracted) ? 20 : 3,
-      durationMinutes: appointment.durationMinutes,
-      excludeAppointmentId: appointment.appointmentId,
-    });
+    let rawSlots: BookingSlot[];
+
+    try {
+      rawSlots = await this.bookingService.getAvailableSlots({
+        tenantId: input.tenantId,
+        serviceId: appointment.serviceId,
+        from: availabilityWindow.from,
+        to: availabilityWindow.to,
+        now: input.occurredAt,
+        maxSlots: shouldOverfetchForTimePreference(extracted) ? 20 : 3,
+        durationMinutes: appointment.durationMinutes,
+        excludeAppointmentId: appointment.appointmentId,
+      });
+    } catch (error) {
+      // Come nella scoperta di una nuova prenotazione: si esce prima del ramo
+      // `reschedule_no_slots_available`, e l'appuntamento attuale non viene
+      // toccato. Un orario di ricambio inventato qui sposterebbe davvero
+      // l'appuntamento del cliente su un orario che non sappiamo se e' libero.
+      if (isCalendarAvailabilityUnavailable(error)) {
+        return availabilityDegradedReply(AVAILABILITY_UNVERIFIABLE_REPLY, error, {
+          action: 'reschedule_availability_unverifiable',
+          appointmentId: appointment.appointmentId,
+        });
+      }
+
+      throw error;
+    }
+
     const slots = filterSlotsByBookingRequest(rawSlots, extracted).slice(0, 3).map(toPendingSlot);
 
     if (slots.length === 0) {
@@ -873,6 +953,8 @@ export class BookingBridgeService {
         },
       };
     } catch (error) {
+      // Il conflitto resta il primo caso trattato, per la stessa ragione della
+      // conferma di prenotazione.
       if (error instanceof AppError && error.code === 'conflict') {
         await this.repository.clearConversationBookingState({
           tenantId: input.tenantId,
@@ -890,6 +972,16 @@ export class BookingBridgeService {
             },
           },
         };
+      }
+
+      // L'appuntamento esistente resta dov'e', la proposta di spostamento e la
+      // sua scadenza restano intatte: il cliente ha ancora esattamente le
+      // stesse opzioni che aveva un istante prima.
+      if (isCalendarAvailabilityUnavailable(error)) {
+        return availabilityDegradedReply(AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY, error, {
+          action: 'reschedule_availability_unverifiable_confirmation',
+          appointmentId: state.appointment.appointmentId,
+        });
       }
 
       throw error;
@@ -1190,6 +1282,35 @@ function selectServiceFromText(
   }
 
   return null;
+}
+
+/**
+ * Costruisce la risposta di degradazione.
+ *
+ * `handled: true` non e' un dettaglio: e' cio' che impedisce al turno di
+ * ricadere sul piano di risposta del modello. Il testo arriva sempre da una
+ * costante, mai composto qui, perche' l'unica proprieta' che i test possono
+ * verificare davvero e' l'uguaglianza byte a byte con quella costante.
+ *
+ * Nei metadata finiscono solo il tipo di guasto e gli identificativi
+ * applicativi: niente numero, niente nome, niente corpo di Google.
+ */
+function availabilityDegradedReply(
+  replyText: string,
+  error: CalendarAvailabilityUnavailable,
+  details: { action: string; serviceId?: string; appointmentId?: string },
+): BookingBridgeReply {
+  return {
+    handled: true,
+    replyText,
+    metadata: {
+      bookingBridge: {
+        ...details,
+        availabilityKind: error.kind,
+        availabilityHttpStatus: error.httpStatus,
+      },
+    },
+  };
 }
 
 function availabilityWindowForRequest(
