@@ -13,6 +13,10 @@ import {
   type InsertAppointmentInput,
 } from '@/server/appointments/booking';
 import { AppError } from '@/lib/errors/app-error';
+import {
+  CalendarAvailabilityUnavailable,
+  isCalendarAvailabilityUnavailable,
+} from '@/server/calendar/availability-error';
 import { deriveCalendarEventId } from '@/server/appointments/calendar-convergence';
 import type { CalendarBusyInterval } from '@/server/calendar/google';
 import { FakeGoogleCalendar, googleError } from '../../fixtures/fake-google-calendar';
@@ -549,6 +553,265 @@ describe('AppointmentBookingService', () => {
   });
 });
 
+/**
+ * PILOT-P0-2 — il servizio non ha il permesso di indovinare.
+ *
+ * Quando il tenant ha Google collegato, ogni esito di `getAvailableSlots` che
+ * non sia "Google ha confermato" deve essere un errore. Le due alternative che
+ * questi test escludono — lista vuota e sole fasce locali — sono entrambe
+ * risposte che sembrano corrette e producono prenotazioni sopra impegni veri.
+ */
+describe('AppointmentBookingService availability verification (PILOT-P0-2)', () => {
+  it('never falls back to local-only slots when Google availability is unverifiable', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    calendar.listBusyError = transientAvailabilityFailure();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    const error = await service
+      .getAvailableSlots({
+        tenantId: 'tenant_1',
+        serviceId: 'service_1',
+        from: new Date('2026-04-27T09:00:00.000Z'),
+        to: new Date('2026-04-27T12:00:00.000Z'),
+        now,
+        maxSlots: 10,
+        slotStepMinutes: 30,
+      })
+      .then((slots) => slots)
+      .catch((caught: unknown) => caught);
+
+    expect(isCalendarAvailabilityUnavailable(error)).toBe(true);
+    expect(Array.isArray(error)).toBe(false);
+  });
+
+  it('inserts zero appointments when create-time revalidation cannot be verified', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    calendar.listBusyError = transientAvailabilityFailure();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    await expect(
+      service.createAppointment({
+        tenantId: 'tenant_1',
+        serviceId: 'service_1',
+        appointmentId: APPOINTMENT_ID,
+        customerIdentifier: '393331112233',
+        customerName: 'Mario Rossi',
+        scheduledAt: new Date('2026-04-27T09:00:00.000Z'),
+        now,
+      }),
+    ).rejects.toBeInstanceOf(CalendarAvailabilityUnavailable);
+
+    // La prova che conta: nessuna riga scritta, quindi nessuna promessa fatta
+    // al cliente che il calendario non conosca.
+    expect(repository.insertedAppointments).toHaveLength(0);
+    expect(calendar.insertCount).toBe(0);
+  });
+
+  it('leaves the existing schedule untouched when reschedule revalidation fails', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    const created = await service.createAppointment({
+      tenantId: 'tenant_1',
+      serviceId: 'service_1',
+      appointmentId: APPOINTMENT_ID,
+      customerIdentifier: '393331112233',
+      customerName: 'Mario Rossi',
+      scheduledAt: new Date('2026-04-27T09:00:00.000Z'),
+      now,
+    });
+    const scheduleUpdatesBefore = repository.scheduleUpdates.length;
+
+    calendar.listBusyError = transientAvailabilityFailure();
+
+    await expect(
+      service.rescheduleAppointment({
+        tenantId: 'tenant_1',
+        appointmentId: created.appointmentId,
+        scheduledAt: new Date('2026-04-27T11:00:00.000Z'),
+        now,
+      }),
+    ).rejects.toBeInstanceOf(CalendarAvailabilityUnavailable);
+
+    expect(repository.scheduleUpdates).toHaveLength(scheduleUpdatesBefore);
+    expect(repository.row(APPOINTMENT_ID)?.scheduledAt.toISOString()).toBe(
+      '2026-04-27T09:00:00.000Z',
+    );
+  });
+
+  it('writes the health marker on a permanent integration auth failure', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    calendar.listBusyError = authAvailabilityFailure();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    await expect(availability(service)).rejects.toBeInstanceOf(CalendarAvailabilityUnavailable);
+
+    expect(repository.availabilityHealthWrites).toEqual([
+      { integrationId: 'integration_1', errorCode: 'google_availability_auth' },
+    ]);
+  });
+
+  it('does not write a permanent marker for a transient failure', async () => {
+    const repository = new FakeBookingRepository();
+    const calendar = new FakeGoogleCalendar();
+    calendar.listBusyError = transientAvailabilityFailure();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    await expect(availability(service)).rejects.toBeInstanceOf(CalendarAvailabilityUnavailable);
+
+    // Un 429 descrive Google adesso, non l'integrazione del tenant: marcarlo
+    // riempirebbe il watchdog di allarmi che si risolvono da soli.
+    expect(repository.availabilityHealthWrites).toHaveLength(0);
+  });
+
+  it('keeps the original availability error when the health write fails', async () => {
+    const repository = new FakeBookingRepository();
+    repository.failAvailabilityHealthWrite = true;
+    const calendar = new FakeGoogleCalendar();
+    calendar.listBusyError = authAvailabilityFailure();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    const error = await availability(service).catch((caught: unknown) => caught);
+
+    // Sostituire l'errore originale con quello dell'osservabilita' perderebbe
+    // la ragione vera del guasto e cambierebbe la risposta al cliente.
+    expect(isCalendarAvailabilityUnavailable(error)).toBe(true);
+    expect((error as CalendarAvailabilityUnavailable).kind).toBe('auth');
+  });
+
+  it('clears an existing marker after a verified success', async () => {
+    const repository = new FakeBookingRepository({
+      googleAvailabilityErrorCode: 'google_availability_auth',
+    });
+    const service = new AppointmentBookingService(
+      repository,
+      new FakeGoogleCalendar(),
+      new FakeNotificationEnqueuer(),
+    );
+
+    await availability(service);
+
+    expect(repository.availabilityHealthClears).toEqual(['integration_1']);
+  });
+
+  it('performs no health UPDATE on a verified success without an existing marker', async () => {
+    const repository = new FakeBookingRepository();
+    const service = new AppointmentBookingService(
+      repository,
+      new FakeGoogleCalendar(),
+      new FakeNotificationEnqueuer(),
+    );
+
+    await availability(service);
+
+    // Senza questa condizione ogni turno di prenotazione andato bene
+    // scriverebbe su `integrations` per azzerare due colonne gia' nulle.
+    expect(repository.availabilityHealthClears).toHaveLength(0);
+  });
+
+  it('keeps verified availability valid when clearing the marker fails', async () => {
+    const repository = new FakeBookingRepository({
+      googleAvailabilityErrorCode: 'google_availability_auth',
+    });
+    repository.failAvailabilityHealthClear = true;
+    const service = new AppointmentBookingService(
+      repository,
+      new FakeGoogleCalendar(),
+      new FakeNotificationEnqueuer(),
+    );
+
+    // Il peggio che accade e' un allarme che sopravvive un giro di troppo.
+    await expect(availability(service)).resolves.toBeInstanceOf(Array);
+  });
+
+  it('keeps Postgres-only availability for a tenant without a Google integration', async () => {
+    const repository = new FakeBookingRepository({ googleCalendarIntegration: null });
+    repository.localBusy = [busy('2026-04-27T09:30:00.000Z', '2026-04-27T10:00:00.000Z')];
+    const calendar = new FakeGoogleCalendar();
+    // Anche con Google guasto: senza integrazione, Google non viene interrogato.
+    calendar.listBusyError = transientAvailabilityFailure();
+    const service = new AppointmentBookingService(
+      repository,
+      calendar,
+      new FakeNotificationEnqueuer(),
+    );
+
+    const slots = await service.getAvailableSlots({
+      tenantId: 'tenant_1',
+      serviceId: 'service_1',
+      from: new Date('2026-04-27T09:00:00.000Z'),
+      to: new Date('2026-04-27T12:00:00.000Z'),
+      now,
+      maxSlots: 10,
+      slotStepMinutes: 30,
+    });
+
+    expect(calendar.listBusyCount).toBe(0);
+    expect(slots.map((slot) => slot.start)).toEqual([
+      '2026-04-27T09:00:00.000Z',
+      '2026-04-27T10:00:00.000Z',
+      '2026-04-27T10:30:00.000Z',
+      '2026-04-27T11:00:00.000Z',
+      '2026-04-27T11:30:00.000Z',
+    ]);
+  });
+});
+
+function availability(service: AppointmentBookingService) {
+  return service.getAvailableSlots({
+    tenantId: 'tenant_1',
+    serviceId: 'service_1',
+    from: new Date('2026-04-27T09:00:00.000Z'),
+    to: new Date('2026-04-27T12:00:00.000Z'),
+    now,
+    maxSlots: 10,
+    slotStepMinutes: 30,
+  });
+}
+
+function transientAvailabilityFailure(): CalendarAvailabilityUnavailable {
+  return new CalendarAvailabilityUnavailable('Google Calendar freeBusy failed (429)', {
+    kind: 'transient',
+    httpStatus: 429,
+    reason: 'freebusy_http_429',
+  });
+}
+
+function authAvailabilityFailure(): CalendarAvailabilityUnavailable {
+  return new CalendarAvailabilityUnavailable('Google Calendar refresh token is no longer valid', {
+    kind: 'auth',
+    reason: 'invalid_grant',
+  });
+}
+
 type StoredAppointment = AppointmentForChange & {
   calendarSyncError: string | null;
   calendarSyncAttempts: number;
@@ -596,6 +859,11 @@ class FakeBookingRepository implements AppointmentBookingRepository {
   }> = [];
   /** Innesto per simulare una scrittura concorrente a meta' riprogrammazione. */
   beforeScheduleUpdate: (() => Promise<void>) | null = null;
+  availabilityHealthWrites: Array<{ integrationId: string; errorCode: string }> = [];
+  availabilityHealthClears: string[] = [];
+  /** Innesto per simulare una scrittura di health fallita. */
+  failAvailabilityHealthWrite = false;
+  failAvailabilityHealthClear = false;
 
   constructor(overrides: Partial<BookingServiceContext> = {}) {
     this.context = {
@@ -614,6 +882,7 @@ class FakeBookingRepository implements AppointmentBookingRepository {
         active: true,
       },
       businessHours: [{ weekday: 1, opensAt: '09:00:00', closesAt: '12:00:00' }],
+      googleAvailabilityErrorCode: null,
       googleCalendarIntegration: {
         id: 'integration_1',
         tenantId: 'tenant_1',
@@ -731,6 +1000,28 @@ class FakeBookingRepository implements AppointmentBookingRepository {
   }
 
   async updateGoogleCalendarAccessToken(): Promise<void> {}
+
+  async markGoogleAvailabilityError(input: {
+    integrationId: string;
+    errorCode: string;
+  }): Promise<void> {
+    if (this.failAvailabilityHealthWrite) {
+      throw new AppError('upstream_error', 'health write failed', { expose: false });
+    }
+
+    this.availabilityHealthWrites.push({
+      integrationId: input.integrationId,
+      errorCode: input.errorCode,
+    });
+  }
+
+  async clearGoogleAvailabilityError(input: { integrationId: string }): Promise<void> {
+    if (this.failAvailabilityHealthClear) {
+      throw new AppError('upstream_error', 'health clear failed', { expose: false });
+    }
+
+    this.availabilityHealthClears.push(input.integrationId);
+  }
 
   async getAppointmentForChange(input: {
     appointmentId: string;

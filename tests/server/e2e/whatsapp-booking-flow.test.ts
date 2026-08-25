@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { RuleBasedIntentClassifier } from '@/server/ai/intent-router';
 import { ReplyOrchestrator } from '@/server/ai/reply-orchestrator';
 import {
+  AVAILABILITY_UNVERIFIABLE_REPLY,
   BookingBridgeService,
   type BookingBridgeRepository,
   type BookingServiceOption,
@@ -70,6 +71,7 @@ import type {
   WhatsAppWebhookRepository,
 } from '@/server/whatsapp/repository';
 import { WhatsAppWebhookPayloadSchema } from '@/types/whatsapp';
+import { CalendarAvailabilityUnavailable } from '@/server/calendar/availability-error';
 
 const tenantId = 'tenant_1';
 const conversationId = 'conversation_1';
@@ -167,6 +169,46 @@ describe('WhatsApp backend booking E2E flow', () => {
       'cancellation_request',
     ]);
     expect(repository.usageIncrements.filter((item) => item.messagesDelta === 1)).toHaveLength(12);
+  });
+
+  it('turns an availability failure into an outbound degraded reply on the same turn', async () => {
+    // PILOT-P0-2, la garanzia end-to-end: un guasto PREVISTO
+    // dell'infrastruttura di disponibilita' non puo' uccidere in silenzio un
+    // turno WhatsApp che sarebbe stato altrimenti idoneo alla risposta
+    // automatica. Il messaggio esce, ed esce con testo deterministico.
+    const repository = new InMemoryWhatsAppBookingRepository();
+    const booking = new InMemoryAppointmentBookingService(repository);
+    booking.availabilityError = new CalendarAvailabilityUnavailable(
+      'Google Calendar freeBusy failed (503)',
+      { kind: 'transient', httpStatus: 503, reason: 'freebusy_http_503' },
+    );
+    const bridge = new BookingBridgeService(
+      repository,
+      booking as unknown as AppointmentBookingService,
+    );
+    const autoReply = new WhatsAppAutoReplyService(repository, {
+      autoReplyEnabled: true,
+      replyOrchestrator: new ReplyOrchestrator(new RuleBasedIntentClassifier()),
+      bookingBridge: bridge,
+    });
+    const webhook = new WhatsAppWebhookService(repository, {
+      autoReplyService: autoReply,
+    });
+
+    await webhook.processPayload(
+      textPayload('wamid.availability.down', 'Vorrei prenotare una prima visita domani mattina'),
+      context,
+    );
+
+    // Un messaggio in uscita, non zero: l'alternativa silenziosa e' un
+    // webhook fallito e un cliente che non riceve niente.
+    expect(repository.outboxJobs).toHaveLength(1);
+    // Il testo contiene la costante deterministica (l'eventuale disclosure AI
+    // viene aggiunta attorno, non al posto).
+    expect(lastOutboundText(repository)).toContain(AVAILABILITY_UNVERIFIABLE_REPLY);
+    expect(repository.appointments).toHaveLength(0);
+    // Nessuno stato fabbricato e nessuno stato cancellato.
+    expect(repository.bookingState()).toBeNull();
   });
 
   it('books an appointment from a WhatsApp voice transcript', async () => {
@@ -679,6 +721,9 @@ class InMemoryAppointmentBookingService {
     durationMinutes?: number;
   }> = [];
 
+  /** Guasto della verifica di disponibilita' (PILOT-P0-2). */
+  availabilityError: Error | null = null;
+
   constructor(private readonly repository: InMemoryWhatsAppBookingRepository) {}
 
   async getAvailableSlots(input: {
@@ -690,6 +735,10 @@ class InMemoryAppointmentBookingService {
     durationMinutes?: number;
   }): Promise<BookingSlot[]> {
     this.availabilityCalls.push(input);
+
+    if (this.availabilityError) {
+      throw this.availabilityError;
+    }
 
     return [
       slot('2026-04-27T09:00:00.000Z', '2026-04-27T09:30:00.000Z'),

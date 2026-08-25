@@ -129,3 +129,84 @@ export function parseGoogleFreeBusyResponse(value: unknown): GoogleFreeBusyRespo
 export function parseGoogleCalendarEventResponse(value: unknown): GoogleCalendarEventResponse {
   return safeParseOrEmpty(GoogleCalendarEventResponseSchema, value);
 }
+
+// ---------------------------------------------------------------------------
+// freeBusy: percorso di parsing STRETTO (PILOT-P0-2)
+// ---------------------------------------------------------------------------
+//
+// `parseGoogleFreeBusyResponse` resta lenient e resta invariato: e' il parser
+// usato per leggere body semi-strutturati, inclusi quelli d'errore, dove
+// pretendere lo schema di successo significherebbe perdere l'informazione
+// utile.
+//
+// La disponibilita' ha bisogno del contrario. Un 200 che non rispetta lo
+// schema, letto con `safeParseOrEmpty`, diventa `{}` e quindi `busy: []`: cioe'
+// "calendario libero". E' esattamente la trasformazione che PILOT-P0-2 esiste
+// per impedire, perche' produce prenotazioni sopra impegni reali.
+//
+// Percio' qui gli estremi `start`/`end` sono OBBLIGATORI: un intervallo busy
+// senza orari non e' un intervallo da ignorare, e' una risposta che non
+// sappiamo leggere.
+
+const GoogleFreeBusyStrictCalendarSchema = z
+  .object({
+    errors: z
+      .array(
+        z
+          .object({
+            domain: z.string().optional(),
+            reason: z.string().optional(),
+          })
+          .passthrough(),
+      )
+      .optional(),
+    busy: z
+      .array(
+        z
+          .object({
+            start: z.string().min(1),
+            end: z.string().min(1),
+          })
+          .passthrough(),
+      )
+      .optional(),
+  })
+  .passthrough();
+
+/**
+ * `.passthrough()` resta: Google aggiunge campi senza preavviso e rifiutare
+ * una risposta valida perche' contiene campi nuovi sarebbe un fail-closed
+ * autoinflitto. La strettezza riguarda i campi che sappiamo servire.
+ */
+export const GoogleFreeBusyStrictResponseSchema = z
+  .object({
+    calendars: z.record(z.string(), GoogleFreeBusyStrictCalendarSchema),
+  })
+  .passthrough();
+
+export type GoogleFreeBusyStrictResponse = z.infer<typeof GoogleFreeBusyStrictResponseSchema>;
+
+export type GoogleFreeBusyStrictParseResult =
+  | { success: true; data: GoogleFreeBusyStrictResponse }
+  | { success: false; issue: string };
+
+/**
+ * Non lancia e non ritorna un fallback vuoto: ritorna un esito che il
+ * chiamante e' obbligato a distinguere.
+ */
+export function parseGoogleFreeBusyResponseStrict(value: unknown): GoogleFreeBusyStrictParseResult {
+  const result = GoogleFreeBusyStrictResponseSchema.safeParse(value);
+
+  if (result.success) {
+    return { success: true, data: result.data };
+  }
+
+  const first = result.error.issues[0];
+
+  return {
+    success: false,
+    issue: first
+      ? `${first.path.join('.') || 'response'}: ${first.message}`
+      : 'invalid freeBusy response',
+  };
+}

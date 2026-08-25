@@ -4,6 +4,8 @@ firma del costruttore. La validazione runtime non aggiungerebbe valore in test. 
 import { describe, expect, it } from 'vitest';
 
 import {
+  AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY,
+  AVAILABILITY_UNVERIFIABLE_REPLY,
   BookingBridgeService,
   type BookingBridgeRepository,
   type BookingServiceOption,
@@ -22,6 +24,8 @@ import type {
   SchedulingDecisionLedger,
 } from '@/server/appointments/decision-ledger';
 import { SLOT_RANKING_VERSION } from '@/server/appointments/slot-ranking';
+import { AppError } from '@/lib/errors/app-error';
+import { CalendarAvailabilityUnavailable } from '@/server/calendar/availability-error';
 
 const occurredAt = new Date('2026-04-27T07:00:00.000Z');
 
@@ -839,6 +843,283 @@ describe('BookingBridgeService — slot ranking', () => {
   });
 });
 
+/**
+ * PILOT-P0-2 — degradazione deterministica ai quattro confini di prodotto.
+ *
+ * La proprieta' condivisa: un guasto della verifica non puo' ne' proporre
+ * orari, ne' dire "non ci sono orari", ne' finire al modello. `handled: true`
+ * con testo costante e' l'unica forma in cui il turno puo' uscire, perche' e'
+ * l'unica che non afferma qualcosa che non sappiamo.
+ */
+describe('BookingBridgeService availability degradation (PILOT-P0-2)', () => {
+  describe('new booking discovery', () => {
+    it('answers with the exact degraded constant instead of proposing slots', async () => {
+      const { service, repository, booking } = discoveryHarness();
+      booking.availabilityError = availabilityFailure();
+
+      const reply = await service.createBookingReply({
+        ...baseInput(),
+        text: 'Vorrei prenotare una prima visita',
+      });
+
+      expect(reply.handled).toBe(true);
+      // Byte a byte: e' l'unica asserzione che dimostra che il testo non e'
+      // stato composto dal modello.
+      expect(reply.replyText).toBe(AVAILABILITY_UNVERIFIABLE_REPLY);
+      expect(reply.metadata).toMatchObject({
+        bookingBridge: { action: 'availability_unverifiable', availabilityKind: 'transient' },
+      });
+      expect(repository.savedState).toBeNull();
+      expect(repository.cleared).toBe(false);
+    });
+
+    it('never reaches the no_slots_available branch', async () => {
+      const { service, booking } = discoveryHarness();
+      booking.availabilityError = availabilityFailure();
+
+      const reply = await service.createBookingReply({
+        ...baseInput(),
+        text: 'Vorrei prenotare una prima visita',
+      });
+
+      // `no_slots_available` afferma che la disponibilita' e' stata verificata
+      // e non ha prodotto orari: e' proprio l'affermazione che qui manca.
+      expect(bridgeAction(reply)).not.toBe('no_slots_available');
+      expect(reply.replyText).not.toContain('non vedo slot liberi');
+    });
+
+    it('still propagates an unrelated failure', async () => {
+      const { service, booking } = discoveryHarness();
+      booking.availabilityError = new AppError('internal', 'unrelated boom', { expose: false });
+
+      await expect(
+        service.createBookingReply({ ...baseInput(), text: 'Vorrei prenotare una prima visita' }),
+      ).rejects.toMatchObject({ code: 'internal' });
+    });
+  });
+
+  describe('booking confirmation', () => {
+    it('answers with the exact degraded confirmation constant and books nothing', async () => {
+      const { service, repository, booking } = confirmationHarness();
+      booking.createError = availabilityFailure();
+
+      const reply = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      expect(reply.handled).toBe(true);
+      expect(reply.replyText).toBe(AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY);
+      expect(bridgeAction(reply)).toBe('availability_unverifiable_confirmation');
+      expect(repository.cleared).toBe(false);
+    });
+
+    it('preserves the proposal state and its original expiry', async () => {
+      const { service, repository, booking } = confirmationHarness();
+      const before = repository.savedState;
+      booking.createError = availabilityFailure();
+
+      await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      // Il cliente ha ancora esattamente le opzioni che aveva un istante prima:
+      // nessuna scadenza estesa, nessuna scadenza accorciata, niente perso.
+      expect(repository.savedState).toBe(before);
+      expect(repository.savedState?.expiresAt).toBe('2026-04-27T07:30:00.000Z');
+    });
+
+    it('books on an explicit customer retry once verification recovers', async () => {
+      const { service, repository, booking } = confirmationHarness();
+      booking.createError = availabilityFailure();
+
+      await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      // Il recupero e' un gesto esplicito del cliente, non un job differito.
+      booking.createError = null;
+      const retry = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      expect(bridgeAction(retry)).toBe('appointment_created');
+      expect(booking.createCalls).toHaveLength(2);
+      expect(repository.cleared).toBe(true);
+    });
+
+    it('keeps a genuine conflict distinct, and first', async () => {
+      const { service, repository, booking } = confirmationHarness();
+      booking.createError = new AppError('conflict', 'Requested appointment slot is unavailable');
+
+      const reply = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      // Il conflitto e' l'esito in cui la disponibilita' E' stata verificata:
+      // raccontarlo come guasto del provider — o viceversa — direbbe al
+      // cliente una cosa falsa in entrambe le direzioni.
+      expect(bridgeAction(reply)).toBe('slot_conflict');
+      expect(reply.replyText).toContain('non risulta piu disponibile');
+      expect(reply.replyText).not.toBe(AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY);
+      expect(repository.cleared).toBe(true);
+    });
+  });
+
+  describe('reschedule discovery', () => {
+    it('answers with the exact degraded constant and guesses no replacement times', async () => {
+      const { service, repository, booking } = rescheduleDiscoveryHarness();
+      booking.availabilityError = availabilityFailure();
+
+      const reply = await service.createBookingReply({
+        ...baseInput(),
+        text: 'domani mattina',
+        intent: 'booking_request',
+      });
+
+      expect(reply.handled).toBe(true);
+      expect(reply.replyText).toBe(AVAILABILITY_UNVERIFIABLE_REPLY);
+      expect(bridgeAction(reply)).toBe('reschedule_availability_unverifiable');
+      // Lo stato precedente non viene sostituito da una proposta inventata.
+      expect(repository.savedState?.status).toBe('reschedule_date_requested');
+    });
+
+    it('never reaches the reschedule_no_slots_available branch', async () => {
+      const { service, booking } = rescheduleDiscoveryHarness();
+      booking.availabilityError = availabilityFailure();
+
+      const reply = await service.createBookingReply({
+        ...baseInput(),
+        text: 'domani mattina',
+        intent: 'booking_request',
+      });
+
+      expect(bridgeAction(reply)).not.toBe('reschedule_no_slots_available');
+      expect(reply.replyText).not.toContain('Non vedo slot liberi in quella fascia');
+    });
+  });
+
+  describe('reschedule confirmation', () => {
+    it('answers with the exact degraded confirmation constant and moves nothing', async () => {
+      const { service, repository, booking } = rescheduleConfirmationHarness();
+      booking.rescheduleError = availabilityFailure();
+
+      const reply = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      expect(reply.handled).toBe(true);
+      expect(reply.replyText).toBe(AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY);
+      expect(bridgeAction(reply)).toBe('reschedule_availability_unverifiable_confirmation');
+      expect(repository.cleared).toBe(false);
+    });
+
+    it('preserves the reschedule proposal state and expiry', async () => {
+      const { service, repository, booking } = rescheduleConfirmationHarness();
+      const before = repository.savedState;
+      booking.rescheduleError = availabilityFailure();
+
+      await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      expect(repository.savedState).toBe(before);
+      expect(repository.savedState?.expiresAt).toBe('2026-04-27T07:30:00.000Z');
+    });
+
+    it('keeps a genuine reschedule conflict distinct, and first', async () => {
+      const { service, repository, booking } = rescheduleConfirmationHarness();
+      booking.rescheduleError = new AppError(
+        'conflict',
+        'Requested appointment slot is unavailable',
+      );
+
+      const reply = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+      expect(bridgeAction(reply)).toBe('reschedule_slot_conflict');
+      expect(reply.replyText).not.toBe(AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY);
+      expect(repository.cleared).toBe(true);
+    });
+  });
+
+  it('never answers a degraded turn with handled:false', async () => {
+    // `handled: false` restituirebbe il piano di risposta del modello, che di
+    // fronte a un calendario guasto non sa di esserlo: e' il percorso da cui
+    // uscirebbero orari inventati con tono sicuro.
+    const harnesses = [
+      {
+        harness: discoveryHarness(),
+        text: 'Vorrei prenotare una prima visita',
+        field: 'availabilityError' as const,
+      },
+      { harness: confirmationHarness(), text: 'confermo 1', field: 'createError' as const },
+      {
+        harness: rescheduleConfirmationHarness(),
+        text: 'confermo 1',
+        field: 'rescheduleError' as const,
+      },
+    ];
+
+    for (const entry of harnesses) {
+      entry.harness.booking[entry.field] = availabilityFailure();
+
+      const reply = await entry.harness.service.createBookingReply({
+        ...baseInput(),
+        text: entry.text,
+      });
+
+      expect(reply.handled).toBe(true);
+      expect([
+        AVAILABILITY_UNVERIFIABLE_REPLY,
+        AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY,
+      ]).toContain(reply.replyText);
+    }
+  });
+});
+
+function availabilityFailure(): CalendarAvailabilityUnavailable {
+  return new CalendarAvailabilityUnavailable('Google Calendar freeBusy failed (429)', {
+    kind: 'transient',
+    httpStatus: 429,
+    reason: 'freebusy_http_429',
+  });
+}
+
+function bridgeAction(reply: { metadata: Record<string, unknown> }): unknown {
+  const bridge = reply.metadata.bookingBridge as Record<string, unknown> | undefined;
+
+  return bridge?.action;
+}
+
+function discoveryHarness() {
+  const repository = new FakeBookingBridgeRepository([serviceOption('service_1', 'Prima visita')]);
+  const booking = new FakeAppointmentBookingService();
+
+  return {
+    repository,
+    booking,
+    service: new BookingBridgeService(repository, booking as unknown as AppointmentBookingService),
+  };
+}
+
+function confirmationHarness() {
+  const harness = discoveryHarness();
+  harness.repository.savedState = stateWithSlots();
+
+  return harness;
+}
+
+function rescheduleDiscoveryHarness() {
+  const harness = discoveryHarness();
+  harness.repository.savedState = {
+    status: 'reschedule_date_requested',
+    appointment: pendingAppointment(),
+    proposedAt: '2026-04-27T07:00:00.000Z',
+    expiresAt: '2026-04-27T07:30:00.000Z',
+  };
+
+  return harness;
+}
+
+function rescheduleConfirmationHarness() {
+  const harness = discoveryHarness();
+  harness.repository.savedState = {
+    status: 'reschedule_slots_proposed',
+    appointment: pendingAppointment(),
+    slots: [toPendingSlot(slot('2026-04-28T14:00:00.000Z', '2026-04-28T14:30:00.000Z'))],
+    request: {},
+    proposedAt: '2026-04-27T07:00:00.000Z',
+    expiresAt: '2026-04-27T07:30:00.000Z',
+  };
+
+  return harness;
+}
+
 class FakeBookingBridgeRepository implements BookingBridgeRepository {
   savedState: ConversationBookingState | null = null;
   cleared = false;
@@ -904,6 +1185,9 @@ class FakeAppointmentBookingService {
     slot('2026-04-28T10:00:00.000Z', '2026-04-28T10:30:00.000Z'),
     slot('2026-04-28T11:00:00.000Z', '2026-04-28T11:30:00.000Z'),
   ];
+  availabilityError: Error | null = null;
+  createError: Error | null = null;
+  rescheduleError: Error | null = null;
 
   async getAvailableSlots(input: {
     tenantId: string;
@@ -916,11 +1200,20 @@ class FakeAppointmentBookingService {
   }): Promise<BookingSlot[]> {
     this.availabilityCalls.push(input);
 
+    if (this.availabilityError) {
+      throw this.availabilityError;
+    }
+
     return this.slots;
   }
 
   async createAppointment(input: CreateAppointmentInput): Promise<{ appointmentId: string }> {
     this.createCalls.push(input);
+
+    if (this.createError) {
+      throw this.createError;
+    }
+
     return { appointmentId: 'appointment_1' };
   }
 
@@ -928,6 +1221,11 @@ class FakeAppointmentBookingService {
     input: RescheduleAppointmentInput,
   ): Promise<{ appointmentId: string }> {
     this.rescheduleCalls.push(input);
+
+    if (this.rescheduleError) {
+      throw this.rescheduleError;
+    }
+
     return { appointmentId: input.appointmentId };
   }
 

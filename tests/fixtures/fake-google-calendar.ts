@@ -51,9 +51,26 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
    */
   trace: string[] | null = null;
 
+  /**
+   * Guasto della VERIFICA di disponibilita'.
+   *
+   * Separato dagli errori di scrittura di proposito: le proprieta' in
+   * discussione in PILOT-P0-2 riguardano la lettura, e confonderle con
+   * `createError` renderebbe i test ciechi proprio sulla distinzione che
+   * contano di dimostrare.
+   */
+  listBusyError: Error | null = null;
+  listBusyCount = 0;
+
   constructor(private readonly busyIntervals: CalendarBusyInterval[] = []) {}
 
   async listBusy(): Promise<CalendarBusyInterval[]> {
+    this.listBusyCount += 1;
+
+    if (this.listBusyError) {
+      throw this.listBusyError;
+    }
+
     return this.busyIntervals;
   }
 
