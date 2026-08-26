@@ -193,7 +193,12 @@ export type CreatedAppointmentWithIntent = {
   calendarSyncStatus: CalendarSyncStatus;
   calendarEventId: string | null;
   calendarEventHtmlLink: string | null;
-} & CalendarWriteAuthorization;
+  /** Null when no remote calendar mutation was authorized. */
+  intentId: string | null;
+  projectionEpoch: number;
+  desiredVersion: number;
+  writeGeneration: number;
+};
 
 /**
  * `slot_conflict` e' l'esito del vincolo di esclusione riparato da P0-7A.
@@ -282,7 +287,9 @@ const CreateRowSchema = z.discriminatedUnion('outcome', [
     projectionEpoch: z.number(),
     desiredVersion: z.number(),
     writeGeneration: z.number(),
-    intentId: z.string(),
+    // A local-only appointment has no remote mutation to authorize, therefore
+    // the SQL primitive correctly returns a null intent id.
+    intentId: z.string().nullable(),
   }),
   z.object({ outcome: z.literal('tenant_gone') }),
   z.object({

@@ -556,6 +556,21 @@ export class AppointmentBookingService {
     // solo a far trovare l'evento sul calendario subito: se fallisce, o se
     // il processo muore, la riga resta recuperabile dal cron.
     if (integration && calendarEventId) {
+      // La transazione locale e' valida anche senza Google, ma una mutazione
+      // remota richiede sempre l'intento che l'ha autorizzata.
+      if (appointment.intentId === null) {
+        throw new AppError('internal', 'Calendar write authorization is missing', {
+          expose: false,
+        });
+      }
+
+      const authorization: CalendarWriteAuthorization = {
+        intentId: appointment.intentId,
+        projectionEpoch: appointment.projectionEpoch,
+        desiredVersion: appointment.desiredVersion,
+        writeGeneration: appointment.writeGeneration,
+      };
+
       const sync = await this.syncAppointmentCalendar({
         tenantId: input.tenantId,
         appointmentId,
@@ -564,7 +579,7 @@ export class AppointmentBookingService {
         now,
         // L'intento di CREATE e' gia' committato dalla transazione sopra: qui
         // non se ne apre un secondo, si usa l'autorizzazione che ne e' uscita.
-        authorization: appointment,
+        authorization,
         target: {
           tenantId: input.tenantId,
           appointmentId,

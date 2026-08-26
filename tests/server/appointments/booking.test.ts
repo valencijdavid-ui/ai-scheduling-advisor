@@ -265,6 +265,7 @@ describe('AppointmentBookingService', () => {
     });
     expect(repository.insertedAppointments[0]?.calendarSyncNextAttemptAt).toBeNull();
     expect(calendar.insertCount).toBe(0);
+    expect(repository.writes.intents).toEqual([]);
   });
 
   it('reschedules an appointment, patches Google Calendar and queues a scoped confirmation', async () => {

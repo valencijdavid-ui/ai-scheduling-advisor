@@ -185,16 +185,20 @@ export class FakeCalendarWriteStore implements CalendarWriteStore {
       writeGeneration: 1,
     });
 
-    const intent = this.recordIntent({
-      tenantId: input.tenantId,
-      appointmentId: input.id,
-      operation: 'create',
-      desiredVersion: 0,
-      writeGeneration: 1,
-      calendarId: input.target?.calendarId ?? null,
-      identitySource: input.target?.identitySource ?? 'unknown',
-      externalEventId: input.calendarEventId,
-    });
+    const hasCalendarIntent =
+      input.calendarProvider === 'google_calendar' && input.calendarEventId !== null;
+    const intent = hasCalendarIntent
+      ? this.recordIntent({
+          tenantId: input.tenantId,
+          appointmentId: input.id,
+          operation: 'create',
+          desiredVersion: 0,
+          writeGeneration: 1,
+          calendarId: input.target?.calendarId ?? null,
+          identitySource: input.target?.identitySource ?? 'unknown',
+          externalEventId: input.calendarEventId,
+        })
+      : null;
 
     return {
       outcome: 'created',
@@ -205,7 +209,7 @@ export class FakeCalendarWriteStore implements CalendarWriteStore {
       calendarSyncStatus: input.calendarSyncStatus,
       calendarEventId: input.calendarEventId,
       calendarEventHtmlLink: null,
-      intentId: intent.id,
+      intentId: intent?.id ?? null,
       projectionEpoch: this.projectionEpoch,
       desiredVersion: 0,
       writeGeneration: 1,

@@ -16,6 +16,11 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createTestDatabase, postgresAvailable, type TestDatabase } from '../../helpers/postgres';
+import { createPostgrestBridge, type PostgrestBridge } from '../../helpers/postgrest-bridge';
+import {
+  SupabaseCalendarWriteStore,
+  type CalendarWriteRpcClient,
+} from '@/server/appointments/calendar-write-intents';
 
 const HAS_POSTGRES = postgresAvailable();
 const describePg = HAS_POSTGRES ? describe : describe.skip;
@@ -47,9 +52,11 @@ const FORBIDDEN_COLUMN_PATTERNS = [
 
 describePg('PILOT-P0-3C-i — intenti di scrittura durevoli', () => {
   let db: TestDatabase;
+  let bridge: PostgrestBridge;
 
   beforeAll(() => {
     db = createTestDatabase();
+    bridge = createPostgrestBridge(db);
   }, 120_000);
 
   afterAll(() => {
@@ -59,6 +66,50 @@ describePg('PILOT-P0-3C-i — intenti di scrittura durevoli', () => {
   // -------------------------------------------------------------------------
   // Durabilita'
   // -------------------------------------------------------------------------
+
+  it('creates a local-only appointment through the production store without an intent', async () => {
+    const tenantId = randomUUID();
+    const appointmentId = randomUUID();
+    db.exec(`
+      insert into public.tenants (id, name, slug, billing_email)
+      values ('${tenantId}', 'Studio locale', 'studio-${tenantId.slice(0, 8)}', 'billing@example.com');
+    `);
+
+    const store = new SupabaseCalendarWriteStore(bridge.client as CalendarWriteRpcClient);
+    const created = await store.createAppointmentWithIntent({
+      id: appointmentId,
+      tenantId,
+      expectedProjectionEpoch: 0,
+      conversationId: null,
+      serviceId: null,
+      serviceName: 'Prima visita',
+      customerIdentifier: PHONE,
+      customerName: 'Mario Rossi',
+      customerPhone: PHONE,
+      scheduledAt: new Date('2026-04-29T09:00:00.000Z'),
+      durationMinutes: 30,
+      notes: null,
+      bookingSource: 'manual',
+      calendarProvider: null,
+      calendarSyncStatus: 'not_configured',
+      calendarEventId: null,
+      calendarSyncNextAttemptAt: null,
+      target: null,
+    });
+
+    expect(created).toMatchObject({
+      outcome: 'created',
+      appointmentId,
+      calendarSyncStatus: 'not_configured',
+      calendarEventId: null,
+      intentId: null,
+    });
+    expect(
+      db.query(
+        `select id from public.calendar_write_intents where appointment_ref = '${appointmentId}'`,
+      ),
+    ).toEqual([]);
+  });
 
   it('survives the deletion of the appointment it refers to', () => {
     const seed = seedAppointmentWithIntent(db);
