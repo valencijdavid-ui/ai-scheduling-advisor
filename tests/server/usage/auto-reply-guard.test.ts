@@ -60,6 +60,7 @@ describe('WhatsAppAutoReplyService usage guard', () => {
 
     const result = await service.handleInboundMessage({
       tenantId: 'tenant_1',
+      expectedProjectionEpoch: 0,
       conversationId: 'conv_1',
       inboundMessageId: 'msg_1',
       inboundExternalId: 'wamid.test',
@@ -104,6 +105,7 @@ describe('WhatsAppAutoReplyService usage guard', () => {
 
     const result = await service.handleInboundMessage({
       tenantId: 'tenant_1',
+      expectedProjectionEpoch: 0,
       conversationId: 'conv_1',
       inboundMessageId: 'msg_2',
       inboundExternalId: 'wamid.ok',

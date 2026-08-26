@@ -233,7 +233,7 @@ describe('GoogleCalendarProvider', () => {
     });
   });
 
-  it('deletes Google Calendar events and treats missing events as already cancelled', async () => {
+  it('deletes Google Calendar events and reports a missing event as absent, not deleted', async () => {
     const fetcher = vi.fn(
       async (_input: RequestInfo | URL, _init?: RequestInit) => new Response('', { status: 404 }),
     );
@@ -246,7 +246,11 @@ describe('GoogleCalendarProvider', () => {
         }),
         eventId: 'event_1',
       }),
-    ).resolves.toEqual({ cancelled: true });
+    ).resolves.toEqual({
+      outcome: 'already_absent',
+      calendarId: 'studio@example.com',
+      httpStatus: 404,
+    });
     expect(String(fetcher.mock.calls[0]?.[0])).toContain(
       '/calendars/studio%40example.com/events/event_1?sendUpdates=none',
     );

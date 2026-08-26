@@ -1,3 +1,4 @@
+import { FakeProjectionFenceReader } from '../../fixtures/fake-projection-fence';
 import { describe, expect, it } from 'vitest';
 
 import { AppError } from '@/lib/errors/app-error';
@@ -43,7 +44,7 @@ describe('WhatsAppVoicePipelineWorker', () => {
       mediaDownloader,
       storage,
       transcriber,
-      { sttModel: 'scribe_v2' },
+      { projectionFence: new FakeProjectionFenceReader(), sttModel: 'scribe_v2' },
     );
 
     const result = await worker.processReadyJobs({ now, lockId: 'worker_1' });
@@ -92,6 +93,7 @@ describe('WhatsAppVoicePipelineWorker', () => {
       new FakeTenantMediaStorage(),
       new FakeVoiceTranscriber(),
       {
+        projectionFence: new FakeProjectionFenceReader(),
         autoReplyHandler,
         sttModel: 'scribe_v2',
       },
@@ -132,6 +134,7 @@ describe('WhatsAppVoicePipelineWorker', () => {
       new FakeTenantMediaStorage(),
       transcriber,
       {
+        projectionFence: new FakeProjectionFenceReader(),
         autoReplyHandler,
       },
     );
@@ -157,6 +160,7 @@ describe('WhatsAppVoicePipelineWorker', () => {
       mediaDownloader,
       new FakeTenantMediaStorage(),
       new FakeVoiceTranscriber(),
+      { projectionFence: new FakeProjectionFenceReader() },
     );
 
     const result = await worker.processReadyJobs({ now });
@@ -183,6 +187,7 @@ describe('WhatsAppVoicePipelineWorker', () => {
       mediaDownloader,
       new FakeTenantMediaStorage(),
       new FakeVoiceTranscriber(),
+      { projectionFence: new FakeProjectionFenceReader() },
     );
 
     const result = await worker.processReadyJobs({ now });

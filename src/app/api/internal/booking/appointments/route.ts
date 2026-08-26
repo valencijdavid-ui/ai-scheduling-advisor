@@ -6,8 +6,29 @@ import { env } from '@/lib/env';
 import { AppError } from '@/lib/errors/app-error';
 import { assertStaticSecretHeader } from '@/lib/security/static-secret';
 import { createAppointmentBookingService } from '@/server/appointments/booking';
+import { createProjectionFenceReader } from '@/server/appointments/projection-fence';
 
 export const runtime = 'nodejs';
+
+/**
+ * CATTURA PRECOCE DELL'EPOCA DI PROIEZIONE (PILOT-P0-3C-i).
+ *
+ * Avviene subito dopo il parse del body e PRIMA di qualunque lettura di stato
+ * applicativo. Se venisse letta piu' tardi — appena prima della scrittura —
+ * una richiesta partita prima di una cancellazione leggerebbe l'epoca NUOVA e
+ * la adotterebbe, riproiettando dati che nel frattempo dovevano essere
+ * distrutti. Il fence direbbe "tutto a posto" nell'unico caso in cui doveva
+ * dire di no.
+ *
+ * Il valore non viene mai rinfrescato: una richiesta stantia deve fallire.
+ * Il rifiuto esce come `conflict` (409) con identificatore tipizzato e senza
+ * numeri di epoca, che sono stato interno del fence.
+ */
+async function captureProjectionEpoch(tenantId: string): Promise<number> {
+  const snapshot = await createProjectionFenceReader().capture(tenantId);
+
+  return snapshot.projectionEpoch;
+}
 
 const CreateAppointmentBodySchema = z.object({
   tenantId: z.string().uuid(),
@@ -53,10 +74,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     });
 
     const body = CreateAppointmentBodySchema.parse(await readOptionalJson(request));
+    const expectedProjectionEpoch = await captureProjectionEpoch(body.tenantId);
     const service = createAppointmentBookingService();
 
     return service.createAppointment({
       tenantId: body.tenantId,
+      expectedProjectionEpoch,
       serviceId: body.serviceId,
       ...(body.conversationId !== undefined ? { conversationId: body.conversationId } : {}),
       customerIdentifier: body.customerIdentifier,
@@ -85,10 +108,12 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
     });
 
     const body = RescheduleAppointmentBodySchema.parse(await readOptionalJson(request));
+    const expectedProjectionEpoch = await captureProjectionEpoch(body.tenantId);
     const service = createAppointmentBookingService();
 
     return service.rescheduleAppointment({
       tenantId: body.tenantId,
+      expectedProjectionEpoch,
       appointmentId: body.appointmentId,
       scheduledAt: body.scheduledAt,
       ...(body.durationMinutes !== undefined ? { durationMinutes: body.durationMinutes } : {}),
@@ -112,10 +137,12 @@ export async function DELETE(request: NextRequest): Promise<NextResponse> {
     });
 
     const body = CancelAppointmentBodySchema.parse(await readOptionalJson(request));
+    const expectedProjectionEpoch = await captureProjectionEpoch(body.tenantId);
     const service = createAppointmentBookingService();
 
     return service.cancelAppointment({
       tenantId: body.tenantId,
+      expectedProjectionEpoch,
       appointmentId: body.appointmentId,
       ...(body.requireCalendarSync !== undefined
         ? { requireCalendarSync: body.requireCalendarSync }

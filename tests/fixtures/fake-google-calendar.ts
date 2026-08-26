@@ -2,6 +2,7 @@ import { AppError } from '@/lib/errors/app-error';
 import type { CalendarConvergenceProvider } from '@/server/appointments/calendar-convergence';
 import type {
   CalendarBusyInterval,
+  GoogleCalendarDeleteOutcome,
   GoogleCalendarEventResult,
   GoogleCalendarEventSnapshot,
 } from '@/server/calendar/google';
@@ -17,6 +18,15 @@ import type {
  */
 export type FakeGoogleEvent = {
   id: string;
+  /**
+   * Calendario su cui l'evento vive DAVVERO.
+   *
+   * Non e' un dettaglio del fake: e' la dimensione che rende osservabile il
+   * difetto C6. Un evento cercato sul calendario sbagliato non si trova, ed e'
+   * esattamente cio' che Google risponde con un 404 — indistinguibile, per chi
+   * non guarda il bersaglio, da un evento che non esiste.
+   */
+  calendarId: string;
   status: 'confirmed' | 'cancelled';
   start: Date;
   end: Date;
@@ -62,7 +72,21 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
   listBusyError: Error | null = null;
   listBusyCount = 0;
 
-  constructor(private readonly busyIntervals: CalendarBusyInterval[] = []) {}
+  constructor(
+    private readonly busyIntervals: CalendarBusyInterval[] = [],
+    readonly defaultCalendarId: string = 'primary',
+  ) {}
+
+  /**
+   * Bersaglio effettivo di una operazione, con la stessa regola del provider
+   * reale: un `calendarId` esplicito vince, altrimenti si usa quello
+   * configurato.
+   */
+  private target(calendarId?: string): string {
+    const explicit = calendarId?.trim();
+
+    return explicit ? explicit : this.defaultCalendarId;
+  }
 
   async listBusy(): Promise<CalendarBusyInterval[]> {
     this.listBusyCount += 1;
@@ -74,16 +98,22 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
     return this.busyIntervals;
   }
 
-  async getEvent(input: { eventId: string }): Promise<GoogleCalendarEventSnapshot | null> {
+  async getEvent(input: {
+    eventId: string;
+    calendarId?: string;
+  }): Promise<GoogleCalendarEventSnapshot | null> {
     this.getCount += 1;
 
     if (this.getError) {
       throw this.getError;
     }
 
+    const calendarId = this.target(input.calendarId);
     const event = this.events.get(input.eventId);
 
-    if (!event) {
+    // Assente, oppure vivo su un ALTRO calendario: da qui i due casi si
+    // vedono identici, ed e' cosi' anche su Google.
+    if (!event || event.calendarId !== calendarId) {
       return null;
     }
 
@@ -93,11 +123,13 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
       status: event.status,
       start: event.start,
       end: event.end,
+      calendarId,
     };
   }
 
   async createEvent(input: {
     eventId?: string;
+    calendarId?: string;
     appointmentId: string;
     summary: string;
     start: Date;
@@ -109,14 +141,18 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
       throw this.createError;
     }
 
+    const calendarId = this.target(input.calendarId);
     const id = input.eventId ?? `generated_${this.events.size + 1}`;
 
+    // L'id e' unico per ACCOUNT, non per calendario: e' quello che rende
+    // deterministica la difesa dai duplicati.
     if (this.events.has(id)) {
       throw googleError(409, 'The requested identifier already exists');
     }
 
     this.events.set(id, {
       id,
+      calendarId,
       status: 'confirmed',
       start: input.start,
       end: input.end,
@@ -132,12 +168,14 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
     return {
       eventId: id,
       htmlLink: `https://calendar.google.com/event?eid=${id}`,
+      calendarId,
       raw: {},
     };
   }
 
   async updateEvent(input: {
     eventId: string;
+    calendarId?: string;
     summary: string;
     start: Date;
     end: Date;
@@ -149,9 +187,10 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
       throw this.updateError;
     }
 
+    const calendarId = this.target(input.calendarId);
     const existing = this.events.get(input.eventId);
 
-    if (!existing) {
+    if (!existing || existing.calendarId !== calendarId) {
       throw googleError(404, 'Not Found');
     }
 
@@ -167,23 +206,34 @@ export class FakeGoogleCalendar implements CalendarConvergenceProvider {
     return {
       eventId: input.eventId,
       htmlLink: existing.htmlLink,
+      calendarId,
       raw: {},
     };
   }
 
-  async cancelEvent(input: { eventId: string }): Promise<{ cancelled: true }> {
+  async cancelEvent(input: {
+    eventId: string;
+    calendarId?: string;
+  }): Promise<GoogleCalendarDeleteOutcome> {
     this.trace?.push('google');
 
     if (this.cancelError) {
       throw this.cancelError;
     }
 
-    // Il provider reale tratta 404/410 come successo: eliminare cio' che non
-    // c'e' e' l'esito desiderato, non un errore.
+    const calendarId = this.target(input.calendarId);
+    const existing = this.events.get(input.eventId);
+
+    // Non c'era SU QUESTO CALENDARIO. Se vive altrove, e' ancora vivo — e
+    // l'esito lo dice invece di dichiarare una cancellazione mai avvenuta.
+    if (!existing || existing.calendarId !== calendarId) {
+      return { outcome: 'already_absent', calendarId, httpStatus: 404 };
+    }
+
     this.events.delete(input.eventId);
     this.deleteCount += 1;
 
-    return { cancelled: true };
+    return { outcome: 'deleted', calendarId, httpStatus: 204 };
   }
 
   /** Eventi visibili sul calendario, cioe' non cancellati. */

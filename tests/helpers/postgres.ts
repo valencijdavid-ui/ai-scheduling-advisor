@@ -12,7 +12,7 @@
 // runtime solo per i test allargherebbe la supply chain di produzione per un
 // bisogno che vive interamente in locale.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { readFileSync, readdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -244,4 +244,145 @@ export function createTestDatabase(): TestDatabase {
       }
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Sessioni concorrenti (PILOT-P0-3C-i)
+// ---------------------------------------------------------------------------
+//
+// Il fence dello scrittore e' una proprieta' di LOCK: due transazioni vere che
+// si contendono la stessa riga di `tenants`. `execFileSync` non puo'
+// dimostrarla — bloccherebbe il processo di test insieme alla query.
+//
+// Qui ogni sessione e' un `psql` interattivo vivo, con la propria transazione.
+// L'attesa non e' una sleep: si osserva `pg_stat_activity` finche' il backend
+// bloccato non dichiara di essere in attesa di un lock. Il test fallisce per
+// timeout, mai per essere arrivato troppo presto.
+
+/** Statement inviato a una sessione, ancora in corso o gia' concluso. */
+export type PendingStatement = {
+  readonly sql: string;
+  readonly done: Promise<string>;
+  /** `false` finche' Postgres non ha risposto: e' cosi' che si vede un blocco. */
+  isSettled(): boolean;
+};
+
+export type PgSession = {
+  /** PID del backend Postgres: serve a osservarne l'attesa da un'altra sessione. */
+  readonly backendPid: number;
+  /** Invia uno statement senza attenderlo. */
+  send(sql: string): PendingStatement;
+  /** Invia uno statement e ne attende l'esito. */
+  run(sql: string): Promise<string>;
+  close(): Promise<void>;
+};
+
+const STATEMENT_MARKER = '__P03C_STATEMENT_DONE__';
+const DEFAULT_BLOCK_TIMEOUT_MS = 10_000;
+
+export async function openSession(db: TestDatabase): Promise<PgSession> {
+  const child: ChildProcess = spawn(
+    'psql',
+    ['-d', db.name, '-q', '-A', '-t', '--no-psqlrc', '-v', 'ON_ERROR_STOP=0'],
+    { stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    throw new Error('psql session did not expose its pipes');
+  }
+
+  let buffer = '';
+  const waiters: Array<{ resolve: (value: string) => void }> = [];
+
+  const drain = (): void => {
+    let index = buffer.indexOf(STATEMENT_MARKER);
+
+    while (index !== -1) {
+      const output = buffer.slice(0, index);
+      buffer = buffer.slice(index + STATEMENT_MARKER.length);
+      waiters.shift()?.resolve(output.trim());
+      index = buffer.indexOf(STATEMENT_MARKER);
+    }
+  };
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    buffer += chunk.toString('utf8');
+    drain();
+  });
+  // stderr entra nello stesso flusso: un errore SQL e' un esito da asserire,
+  // non un guasto del harness.
+  child.stderr.on('data', (chunk: Buffer) => {
+    buffer += chunk.toString('utf8');
+    drain();
+  });
+
+  const send = (sql: string): PendingStatement => {
+    let settled = false;
+    const done = new Promise<string>((resolve) => {
+      waiters.push({
+        resolve: (value) => {
+          settled = true;
+          resolve(value);
+        },
+      });
+    });
+
+    child.stdin?.write(`${sql}\n\\echo ${STATEMENT_MARKER}\n`);
+
+    return { sql, done, isSettled: () => settled };
+  };
+
+  const run = (sql: string): Promise<string> => send(sql).done;
+
+  const backendPid = Number((await run('select pg_backend_pid();')).trim());
+
+  if (!Number.isInteger(backendPid) || backendPid <= 0) {
+    throw new Error('psql session did not report a backend pid');
+  }
+
+  return {
+    backendPid,
+    send,
+    run,
+    async close(): Promise<void> {
+      await new Promise<void>((resolve) => {
+        child.once('exit', () => resolve());
+        child.stdin?.end('\\q\n');
+        setTimeout(() => {
+          child.kill('SIGKILL');
+          resolve();
+        }, 2_000).unref();
+      });
+    },
+  };
+}
+
+/**
+ * Attende che un backend dichiari di essere in attesa di un LOCK.
+ *
+ * E' l'alternativa alla sleep: l'attesa termina su un fatto osservato in
+ * `pg_stat_activity`, e il timeout e' un fallimento del test, non un caso
+ * ammesso.
+ */
+export async function waitUntilBlockedOnLock(
+  db: TestDatabase,
+  backendPid: number,
+  timeoutMs: number = DEFAULT_BLOCK_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const rows = db.query<{ wait_event_type: string | null; state: string | null }>(
+      `select wait_event_type, state from pg_stat_activity where pid = ${backendPid}`,
+    );
+    const row = rows[0];
+
+    if (row?.wait_event_type === 'Lock') {
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  throw new Error(`backend ${backendPid} never blocked on a lock within ${timeoutMs}ms`);
 }

@@ -2,6 +2,7 @@
 AppointmentBookingService vengono castati per soddisfare la firma del tipo,
 senza necessità di validazione runtime in test. */
 
+import { FakeProjectionFenceReader } from '../../fixtures/fake-projection-fence';
 import { describe, expect, it } from 'vitest';
 
 import { RuleBasedIntentClassifier } from '@/server/ai/intent-router';
@@ -96,6 +97,7 @@ describe('WhatsApp backend booking E2E flow', () => {
       bookingBridge: bridge,
     });
     const webhook = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
       autoReplyService: autoReply,
     });
 
@@ -192,6 +194,7 @@ describe('WhatsApp backend booking E2E flow', () => {
       bookingBridge: bridge,
     });
     const webhook = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
       autoReplyService: autoReply,
     });
 
@@ -224,6 +227,7 @@ describe('WhatsApp backend booking E2E flow', () => {
       bookingBridge: bridge,
     });
     const webhook = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
       autoReplyService: autoReply,
     });
     const voiceWorker = new WhatsAppVoicePipelineWorker(
@@ -232,6 +236,7 @@ describe('WhatsApp backend booking E2E flow', () => {
       new InMemoryTenantMediaStorage(),
       new InMemoryVoiceTranscriber('Vorrei prenotare una prima visita domani mattina'),
       {
+        projectionFence: new FakeProjectionFenceReader(),
         autoReplyHandler: autoReply,
         sttModel: 'scribe_v2',
       },
@@ -295,6 +300,7 @@ describe('WhatsApp backend booking E2E flow', () => {
       bookingBridge: bridge,
     });
     const webhook = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
       autoReplyService: autoReply,
     });
 

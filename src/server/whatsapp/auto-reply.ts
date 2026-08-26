@@ -28,6 +28,15 @@ export type WhatsAppAutoReplySource = 'text' | 'voice_transcript';
 
 export type WhatsAppAutoReplyInput = {
   tenantId: string;
+  /**
+   * Epoca di proiezione del TURNO, catturata al dispatch del messaggio
+   * inbound — dopo che il tenant e' noto, prima di qualunque lettura di stato
+   * conversazione o di prenotazione.
+   *
+   * Attraversa il turno immutabile. Non ha default: un percorso che dimentica
+   * di passarla deve rompersi in compilazione.
+   */
+  expectedProjectionEpoch: number;
   conversationId: string;
   inboundMessageId: string;
   inboundExternalId: string;
@@ -363,6 +372,7 @@ export class WhatsAppAutoReplyService implements WhatsAppAutoReplyHandler {
 
     const bookingReply = await this.bookingBridge.createBookingReply({
       tenantId: input.tenantId,
+      expectedProjectionEpoch: input.expectedProjectionEpoch,
       conversationId: input.conversationId,
       customerIdentifier: input.customerIdentifier,
       customerName: null,

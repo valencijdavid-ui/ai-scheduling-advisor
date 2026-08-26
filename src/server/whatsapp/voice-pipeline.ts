@@ -14,6 +14,10 @@ import {
 } from '@/server/whatsapp/media';
 import { SupabaseWhatsAppWebhookRepository } from '@/server/whatsapp/repository';
 import {
+  createProjectionFenceReader,
+  type ProjectionFenceReader,
+} from '@/server/appointments/projection-fence';
+import {
   createWhatsAppVoiceRepository,
   currentSttModel,
   type ClaimedWhatsAppVoiceJob,
@@ -50,8 +54,22 @@ export class WhatsAppVoicePipelineWorker {
       // Fatto da Claude Code 2026-04-27: usage limits opzionale per
       // incrementare il counter `voice_messages_count` post-trascrizione.
       usageLimits?: UsageLimitsService;
+      projectionFence?: ProjectionFenceReader;
     } = {},
   ) {}
+
+  /**
+   * Fence del TURNO VOCALE.
+   *
+   * Il job vocale e' un turno logico a se': viene servito piu' tardi, e la
+   * sua autorita' e' quella osservata quando comincia ad agire sui dati del
+   * cliente — non quella del webhook che lo aveva accodato.
+   */
+  private get projectionFence(): ProjectionFenceReader {
+    return (this.fenceReader ??= this.options.projectionFence ?? createProjectionFenceReader());
+  }
+
+  private fenceReader: ProjectionFenceReader | undefined;
 
   async processReadyJobs(
     input: {
@@ -91,13 +109,20 @@ export class WhatsAppVoicePipelineWorker {
     let voiceEventId: string | null = null;
 
     try {
+      // CATTURA PRECOCE DELL'EPOCA (PILOT-P0-3C-i).
+      //
+      // Il job vocale e' un turno logico a se': il tenant e' noto, e la riga
+      // sotto e' la PRIMA lettura di dati del cliente di questo turno. L'epoca
+      // catturata qui vale per tutto il job e non viene mai rinfrescata.
+      const projectionEpoch = (await this.projectionFence.capture(job.tenantId)).projectionEpoch;
+
       const existingContext = await this.repository.getVoiceReplyContext({
         tenantId: job.tenantId,
         messageId: job.messageId,
       });
 
       if (existingContext && existingContext.transcriptText !== null) {
-        await this.handleAutoReply(existingContext);
+        await this.handleAutoReply(existingContext, projectionEpoch);
         await this.repository.markJobCompleted(job.id);
 
         return 'completed';
@@ -182,7 +207,7 @@ export class WhatsAppVoicePipelineWorker {
         }
       }
 
-      await this.handleAutoReplyFromJob(job);
+      await this.handleAutoReplyFromJob(job, projectionEpoch);
       await this.repository.markJobCompleted(job.id);
 
       return 'completed';
@@ -223,7 +248,10 @@ export class WhatsAppVoicePipelineWorker {
     }
   }
 
-  private async handleAutoReplyFromJob(job: ClaimedWhatsAppVoiceJob): Promise<void> {
+  private async handleAutoReplyFromJob(
+    job: ClaimedWhatsAppVoiceJob,
+    expectedProjectionEpoch: number,
+  ): Promise<void> {
     const context = await this.repository.getVoiceReplyContext({
       tenantId: job.tenantId,
       messageId: job.messageId,
@@ -233,16 +261,20 @@ export class WhatsAppVoicePipelineWorker {
       throw new AppError('bad_request', 'WhatsApp voice message was not found after transcription');
     }
 
-    await this.handleAutoReply(context);
+    await this.handleAutoReply(context, expectedProjectionEpoch);
   }
 
-  private async handleAutoReply(context: WhatsAppVoiceReplyContext): Promise<void> {
+  private async handleAutoReply(
+    context: WhatsAppVoiceReplyContext,
+    expectedProjectionEpoch: number,
+  ): Promise<void> {
     if (!this.options.autoReplyHandler) {
       return;
     }
 
     await this.options.autoReplyHandler.handleInboundMessage({
       tenantId: context.tenantId,
+      expectedProjectionEpoch,
       conversationId: context.conversationId,
       inboundMessageId: context.messageId,
       inboundExternalId: context.externalId,

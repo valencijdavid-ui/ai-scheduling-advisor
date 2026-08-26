@@ -65,7 +65,12 @@ describe('API routes shape (smoke)', () => {
     if (failures.length > 0) {
       throw new Error(`Route shape failures:\n${failures.join('\n')}`);
     }
-  });
+    // 30s: questo test transpila e importa a runtime TUTTE le route (42 file,
+    // con i loro grafi di import). Il default di 5s di Vitest bastava quando il
+    // test girava da solo, ma sotto la concorrenza della suite completa veniva
+    // superato in modo intermittente. Il tetto resta finito: serve a fallire su
+    // un blocco vero, non a inseguire la macchina piu' lenta.
+  }, 30_000);
 
   it('all route files compile without TypeScript errors (covered by typecheck)', () => {
     expect(true).toBe(true);

@@ -31,7 +31,10 @@
 // mezzo quella dipendenza; il 409 resta gestito come rete di sicurezza.
 
 import { AppError } from '@/lib/errors/app-error';
+import { createCalendarWriteBudget } from '@/server/calendar/google';
 import type {
+  CalendarWriteBudget,
+  GoogleCalendarDeleteOutcome,
   GoogleCalendarEventResult,
   GoogleCalendarEventSnapshot,
   GoogleCalendarIntegration,
@@ -180,10 +183,13 @@ export type CalendarConvergenceProvider = {
   getEvent(input: {
     integration: GoogleCalendarIntegration;
     eventId: string;
+    calendarId?: string;
+    budget?: CalendarWriteBudget;
   }): Promise<GoogleCalendarEventSnapshot | null>;
   createEvent(input: {
     integration: GoogleCalendarIntegration;
     eventId?: string;
+    budget?: CalendarWriteBudget;
     appointmentId: string;
     tenantId: string;
     summary: string;
@@ -199,6 +205,8 @@ export type CalendarConvergenceProvider = {
   updateEvent(input: {
     integration: GoogleCalendarIntegration;
     eventId: string;
+    calendarId?: string;
+    budget?: CalendarWriteBudget;
     appointmentId: string;
     tenantId: string;
     summary: string;
@@ -215,7 +223,9 @@ export type CalendarConvergenceProvider = {
   cancelEvent(input: {
     integration: GoogleCalendarIntegration;
     eventId: string;
-  }): Promise<{ cancelled: true }>;
+    calendarId?: string;
+    budget?: CalendarWriteBudget;
+  }): Promise<GoogleCalendarDeleteOutcome>;
 };
 
 /**
@@ -229,6 +239,14 @@ export type CalendarConvergenceTarget = {
   appointmentId: string;
   /** Identita' operativa: il valore persistito, mai ricalcolato. */
   eventId: string;
+  /**
+   * Provenienza VERIFICATA dell'evento, quando esiste.
+   *
+   * Governa GET, PATCH e DELETE: un evento gia' scritto va raggiunto dove vive
+   * davvero. Assente significa "non lo sappiamo ancora" — e allora si usa il
+   * calendario configurato adesso, che pero' resta un'ipotesi, non una prova.
+   */
+  calendarId?: string | null;
   status: 'confirmed' | 'cancelled';
   start: Date;
   end: Date;
@@ -252,6 +270,23 @@ export type CalendarConvergenceResult = {
   eventId: string;
   htmlLink: string | null;
   action: CalendarConvergenceAction;
+  /**
+   * Calendario CONTATTATO DAVVERO da questa operazione.
+   *
+   * Va propagato fino al settle e persistito li', nella stessa transazione che
+   * registra l'esito. Ricostruirlo dopo rileggendo la configurazione
+   * significherebbe dedurre una verita' storica da un valore mutevole.
+   */
+  calendarId: string;
+  /**
+   * `true` solo quando l'esito DIMOSTRA che l'evento vive su `calendarId`.
+   *
+   * Un 404/410 non lo dimostra: dice "non l'ho trovato qui", il che e'
+   * esattamente cio' che si osserva anche quando si e' bussato al calendario
+   * sbagliato. Una assenza non puo' rafforzare la provenienza, altrimenti il
+   * primo errore di bersaglio si cristallizzerebbe come verita'.
+   */
+  calendarIdVerified: boolean;
 };
 
 /**
@@ -272,29 +307,71 @@ export async function convergeCalendarEvent(input: {
   provider: CalendarConvergenceProvider;
   integration: GoogleCalendarIntegration;
   target: CalendarConvergenceTarget;
+  /**
+   * Budget di rete dell'INTERA convergenza.
+   *
+   * Una convergenza puo' essere refresh + GET + POST + 409 + GET + PATCH: sono
+   * un solo gesto applicativo e devono avere un solo tetto. Se non viene
+   * passato se ne apre uno qui, cosi' che nessun percorso resti senza.
+   */
+  budget?: CalendarWriteBudget;
 }): Promise<CalendarConvergenceResult> {
   const { provider, integration, target } = input;
+  const budget = input.budget ?? createCalendarWriteBudget();
+  // La provenienza memorizzata e' un bersaglio, non un suggerimento: quando
+  // c'e', ogni chiamata su un evento GIA' ESISTENTE va li'.
+  const targeting = calendarTargeting(target);
 
   if (target.status === 'cancelled') {
-    await provider.cancelEvent({ integration, eventId: target.eventId });
+    const outcome = await provider.cancelEvent({
+      integration,
+      eventId: target.eventId,
+      ...targeting,
+      budget,
+    });
 
-    return { eventId: target.eventId, htmlLink: null, action: 'deleted' };
+    // I due esiti restano distinti fin qui. `already_absent` non e' una
+    // cancellazione: e' l'assenza su UN calendario, e non promuove quel
+    // calendario a provenienza.
+    return {
+      eventId: target.eventId,
+      htmlLink: null,
+      action: outcome.outcome === 'deleted' ? 'deleted' : 'already_absent',
+      calendarId: outcome.calendarId,
+      calendarIdVerified: outcome.outcome === 'deleted',
+    };
   }
 
-  const existing = await provider.getEvent({ integration, eventId: target.eventId });
+  const existing = await provider.getEvent({
+    integration,
+    eventId: target.eventId,
+    ...targeting,
+    budget,
+  });
 
   if (existing) {
-    return convergeExistingEvent({ provider, integration, target, existing });
+    return convergeExistingEvent({ provider, integration, target, existing, budget });
   }
 
   try {
+    // La CREAZIONE e' l'unico caso che non ha provenienza da rispettare:
+    // l'evento non esiste ancora, quindi nasce sul calendario configurato
+    // adesso. Non si passa `targeting`: un bersaglio storico qui sarebbe la
+    // scelta sbagliata, e il calendario effettivo torna comunque nel risultato.
     const created = await provider.createEvent({
       integration,
       eventId: target.eventId,
+      budget,
       ...eventPayload(target),
     });
 
-    return { eventId: created.eventId, htmlLink: created.htmlLink, action: 'inserted' };
+    return {
+      eventId: created.eventId,
+      htmlLink: created.htmlLink,
+      action: 'inserted',
+      calendarId: created.calendarId,
+      calendarIdVerified: true,
+    };
   } catch (error) {
     if (googleStatusOf(error) !== 409) {
       throw error;
@@ -304,7 +381,12 @@ export async function convergeCalendarEvent(input: {
     // l'evento con lo stesso id. Non e' un duplicato — e' esattamente cio'
     // che l'id deterministico serve a garantire — quindi si rilegge e si
     // converge sull'evento che ora esiste.
-    const raced = await provider.getEvent({ integration, eventId: target.eventId });
+    const raced = await provider.getEvent({
+      integration,
+      eventId: target.eventId,
+      ...targeting,
+      budget,
+    });
 
     if (!raced) {
       throw new AppError(
@@ -314,8 +396,21 @@ export async function convergeCalendarEvent(input: {
       );
     }
 
-    return convergeExistingEvent({ provider, integration, target, existing: raced });
+    return convergeExistingEvent({ provider, integration, target, existing: raced, budget });
   }
+}
+
+/**
+ * Bersaglio esplicito da passare alle operazioni su un evento esistente.
+ *
+ * Spread condizionale e non `calendarId: target.calendarId ?? undefined`:
+ * con `exactOptionalPropertyTypes` una proprieta' opzionale valorizzata
+ * `undefined` non e' la stessa cosa di una proprieta' assente.
+ */
+function calendarTargeting(target: CalendarConvergenceTarget): { calendarId?: string } {
+  const stored = target.calendarId?.trim();
+
+  return stored ? { calendarId: stored } : {};
 }
 
 async function convergeExistingEvent(input: {
@@ -323,11 +418,20 @@ async function convergeExistingEvent(input: {
   integration: GoogleCalendarIntegration;
   target: CalendarConvergenceTarget;
   existing: GoogleCalendarEventSnapshot;
+  budget: CalendarWriteBudget;
 }): Promise<CalendarConvergenceResult> {
-  const { provider, integration, target, existing } = input;
+  const { provider, integration, target, existing, budget } = input;
 
   if (!isDivergent(existing, target)) {
-    return { eventId: existing.eventId, htmlLink: existing.htmlLink, action: 'unchanged' };
+    // L'evento e' stato OSSERVATO su questo calendario: e' una prova positiva,
+    // e promuove il bersaglio a provenienza verificata.
+    return {
+      eventId: existing.eventId,
+      htmlLink: existing.htmlLink,
+      action: 'unchanged',
+      calendarId: existing.calendarId,
+      calendarIdVerified: true,
+    };
   }
 
   // `status: 'confirmed'` e' esplicito perche' il caso reale non e' solo
@@ -338,11 +442,21 @@ async function convergeExistingEvent(input: {
   const updated = await provider.updateEvent({
     integration,
     eventId: target.eventId,
+    // La PATCH raggiunge il calendario su cui l'evento e' appena stato letto,
+    // non quello che la configurazione nomina adesso.
+    calendarId: existing.calendarId,
+    budget,
     status: 'confirmed',
     ...eventPayload(target),
   });
 
-  return { eventId: updated.eventId, htmlLink: updated.htmlLink, action: 'patched' };
+  return {
+    eventId: updated.eventId,
+    htmlLink: updated.htmlLink,
+    action: 'patched',
+    calendarId: updated.calendarId,
+    calendarIdVerified: true,
+  };
 }
 
 /**
