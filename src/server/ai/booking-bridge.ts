@@ -32,9 +32,19 @@ import {
   type RankedSlot,
 } from '@/server/appointments/slot-ranking';
 import type { IntentCategory } from '@/server/ai/intent-router';
+import { isProjectionFenceRejection } from '@/server/appointments/projection-fence';
 
 export type BookingBridgeInput = {
   tenantId: string;
+  /**
+   * Epoca di proiezione del TURNO, catturata al confine del turno inbound.
+   *
+   * Attraversa il bridge senza mai essere riletta: e' l'autorita' sotto cui
+   * questo turno ha cominciato a trattenere dati del cliente, e un turno
+   * cominciato prima di una cancellazione deve fallire, non adottare quella
+   * nuova.
+   */
+  expectedProjectionEpoch: number;
   conversationId: string;
   customerIdentifier: string;
   customerName: string | null;
@@ -63,6 +73,23 @@ export type BookingBridgeReply = {
  * inviata su questo percorso, e promettere un intervento che non parte e' peggio
  * che non prometterlo.
  */
+/**
+ * Rifiuto del FENCE DI PROIEZIONE (PILOT-P0-3C-i).
+ *
+ * Il turno era partito sotto un'autorita' che nel frattempo e' cambiata — nel
+ * caso che conta, perche' i dati di quel cliente sono stati cancellati. La
+ * risposta e' deterministica e chiede un GESTO NUOVO del cliente: non si
+ * rigioca il turno vecchio, non si riprova in silenzio con l'epoca corrente,
+ * e non si contatta Google. Riprovare per conto suo significherebbe
+ * riproiettare, sotto l'autorita' nuova, la PII che il turno vecchio si
+ * portava dietro — cioe' esattamente cio' che il fence esiste per impedire.
+ *
+ * Non contiene numeri di epoca: sono stato interno del fence e non vogliono
+ * dire niente per chi sta scrivendo.
+ */
+export const PROJECTION_FENCE_RETRY_REPLY =
+  'Non sono riuscito a completare questa richiesta perche i dati di questa conversazione sono cambiati nel frattempo. Scrivimi di nuovo cosa ti serve e ricomincio da capo.';
+
 export const AVAILABILITY_UNVERIFIABLE_REPLY =
   'Non riesco a controllare il calendario in questo momento, quindi non posso proporti orari senza rischiare di sbagliare. Riprova fra qualche minuto e ricontrollo subito.';
 
@@ -441,6 +468,7 @@ export class BookingBridgeService {
     try {
       const appointment = await this.bookingService.createAppointment({
         tenantId: input.tenantId,
+        expectedProjectionEpoch: input.expectedProjectionEpoch,
         serviceId: slot.serviceId,
         conversationId: input.conversationId,
         customerIdentifier: input.customerIdentifier,
@@ -478,6 +506,14 @@ export class BookingBridgeService {
       // disponibilita' E' stata verificata e lo slot risulta occupato. Se
       // venisse dopo, un guasto del provider potrebbe essere raccontato al
       // cliente come "slot preso da qualcun altro", che e' falso.
+      // Il fence viene PRIMA del conflitto generico: entrambi sono `conflict`,
+      // e senza questo ordine un turno rifiutato dal fence verrebbe raccontato
+      // al cliente come "slot occupato" — una spiegazione falsa di un fatto
+      // completamente diverso.
+      if (isProjectionFenceRejection(error)) {
+        return this.projectionFenceReply(input, { action: 'projection_fence_rejected' });
+      }
+
       if (error instanceof AppError && error.code === 'conflict') {
         await this.repository.clearConversationBookingState({
           tenantId: input.tenantId,
@@ -923,6 +959,7 @@ export class BookingBridgeService {
 
     const rescheduleInput: RescheduleAppointmentInput = {
       tenantId: input.tenantId,
+      expectedProjectionEpoch: input.expectedProjectionEpoch,
       appointmentId: state.appointment.appointmentId,
       scheduledAt: new Date(slot.start),
       durationMinutes: slot.durationMinutes,
@@ -953,6 +990,13 @@ export class BookingBridgeService {
         },
       };
     } catch (error) {
+      if (isProjectionFenceRejection(error)) {
+        return this.projectionFenceReply(input, {
+          action: 'projection_fence_rejected',
+          appointmentId: state.appointment.appointmentId,
+        });
+      }
+
       // Il conflitto resta il primo caso trattato, per la stessa ragione della
       // conferma di prenotazione.
       if (error instanceof AppError && error.code === 'conflict') {
@@ -1050,20 +1094,83 @@ export class BookingBridgeService {
     return this.cancelSelectedAppointment(input, appointment);
   }
 
+  /**
+   * Degradazione deterministica del turno rifiutato dal fence.
+   *
+   * Lo stato di prenotazione della conversazione viene azzerato: la proposta
+   * che il cliente stava confermando apparteneva a un turno la cui autorita'
+   * non esiste piu', e tenerla in vita inviterebbe a riconfermarla. Il
+   * prossimo messaggio del cliente ricomincia, e ricomincia con un'epoca
+   * catturata da capo.
+   */
+  private async projectionFenceReply(
+    input: BookingBridgeInput,
+    metadata: Record<string, unknown>,
+  ): Promise<BookingBridgeReply> {
+    await this.repository.clearConversationBookingState({
+      tenantId: input.tenantId,
+      conversationId: input.conversationId,
+    });
+
+    return {
+      handled: true,
+      replyText: PROJECTION_FENCE_RETRY_REPLY,
+      metadata: { bookingBridge: metadata },
+    };
+  }
+
   private async cancelSelectedAppointment(
     input: BookingBridgeInput,
     appointment: PendingAppointmentReference,
   ): Promise<BookingBridgeReply> {
     const cancelInput: CancelAppointmentInput = {
       tenantId: input.tenantId,
+      expectedProjectionEpoch: input.expectedProjectionEpoch,
       appointmentId: appointment.appointmentId,
       requireCalendarSync: false,
       sendCancellation: true,
       now: input.occurredAt,
     };
-    const result = (await this.bookingService.cancelAppointment(
-      cancelInput,
-    )) as ChangeAppointmentResult;
+    let result: ChangeAppointmentResult;
+
+    try {
+      result = (await this.bookingService.cancelAppointment(
+        cancelInput,
+      )) as ChangeAppointmentResult;
+    } catch (error) {
+      if (isProjectionFenceRejection(error)) {
+        return this.projectionFenceReply(input, {
+          action: 'projection_fence_rejected',
+          appointmentId: appointment.appointmentId,
+        });
+      }
+
+      // C3. L'annullamento autorevole non e' avvenuto: la riga non e' piu'
+      // `confirmed`, o non esiste piu'. Prima questo caso passava inosservato e
+      // il turno proseguiva fino a mandare una DELETE a Google per conto di uno
+      // stato che non aveva mai cambiato — e diceva al cliente "ho annullato".
+      // Adesso e' un esito, e il cliente riceve la verita'.
+      if (error instanceof AppError && error.code === 'conflict') {
+        await this.repository.clearConversationBookingState({
+          tenantId: input.tenantId,
+          conversationId: input.conversationId,
+        });
+
+        return {
+          handled: true,
+          replyText:
+            'Quell appuntamento non risulta piu attivo, quindi non c era niente da annullare. Se ti serve altro scrivimi pure.',
+          metadata: {
+            bookingBridge: {
+              action: 'cancel_not_confirmed',
+              appointmentId: appointment.appointmentId,
+            },
+          },
+        };
+      }
+
+      throw error;
+    }
 
     await this.repository.clearConversationBookingState({
       tenantId: input.tenantId,

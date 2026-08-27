@@ -31,8 +31,16 @@ import {
   buildAppointmentCalendarDescription,
   buildAppointmentCalendarSummary,
   SupabaseAppointmentBookingRepository,
-  type CalendarSyncStatus,
 } from '@/server/appointments/booking';
+import {
+  SupabaseCalendarWriteStore,
+  calendarWriteErrorCode,
+  casFor,
+  evidenceForAction,
+  type CalendarTarget,
+  type CalendarWriteAuthorization,
+  type CalendarWriteStore,
+} from '@/server/appointments/calendar-write-intents';
 import {
   CALENDAR_SYNC_LEASE_MS,
   CALENDAR_SYNC_MAX_ATTEMPTS,
@@ -42,7 +50,13 @@ import {
   type CalendarConvergenceProvider,
   type CalendarConvergenceTarget,
 } from '@/server/appointments/calendar-convergence';
-import { GoogleCalendarProvider, type GoogleCalendarIntegration } from '@/server/calendar/google';
+import {
+  GoogleCalendarProvider,
+  createCalendarWriteBudget,
+  effectiveCalendarId,
+  isUnknownCalendarWriteOutcome,
+  type GoogleCalendarIntegration,
+} from '@/server/calendar/google';
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -64,6 +78,18 @@ export type DueCalendarSync = {
   customerPhone: string | null;
   notes: string | null;
   attempts: number;
+  /**
+   * Stato desiderato OSSERVATO sulla riga.
+   *
+   * La rivendicazione non autorizza niente da sola: e' un lease contro altri
+   * worker, non un diritto di scrivere l'esito. Sono questa versione — piu'
+   * l'epoca del tenant e la generazione allocata dall'intento — a decidere se
+   * il risultato di questo tentativo vale ancora quando arriva il momento di
+   * registrarlo.
+   */
+  desiredVersion: number;
+  /** Provenienza verificata, quando esiste. Governa GET/PATCH/DELETE. */
+  calendarEventCalendarId: string | null;
 };
 
 export type TenantCalendarContext = {
@@ -71,6 +97,16 @@ export type TenantCalendarContext = {
   studioName: string;
   address: string | null;
   integration: GoogleCalendarIntegration | null;
+  /**
+   * Epoca di proiezione del tenant, letta all'inizio del giro di questo
+   * worker.
+   *
+   * Il tick del reconciler e' un turno logico a se': cattura l'autorita'
+   * quando comincia ad agire, e la primitiva la riverifica sotto lock. Non e'
+   * un valore della riga — vive sul tenant — e non poteva quindi arrivare
+   * dallo scanner degli appuntamenti.
+   */
+  projectionEpoch: number;
 };
 
 export interface CalendarReconcilerRepository {
@@ -89,18 +125,18 @@ export interface CalendarReconcilerRepository {
     leaseUntil: Date;
     lastAttemptAt: Date;
   }): Promise<boolean>;
-  updateAppointmentCalendarSync(input: {
-    tenantId: string;
-    appointmentId: string;
-    status: CalendarSyncStatus;
-    eventId?: string;
-    htmlLink?: string | null;
-    errorMessage: string | null;
-    attempts: number;
-    nextAttemptAt: Date | null;
-    lastAttemptAt: Date;
-  }): Promise<void>;
 }
+
+// NOTA DI CONFINE (PILOT-P0-3C-i)
+//
+// `updateAppointmentCalendarSync` non esiste piu' qui. Era la SECONDA
+// implementazione di settle: scriveva `calendar_sync_status` per conto proprio,
+// senza sapere quante righe toccava e senza confrontarsi con la versione
+// desiderata. Un worker partito prima di una riprogrammazione poteva quindi
+// marcare `synced` una riga il cui stato desiderato era gia' cambiato, e la
+// riga spariva dalla vista dello scanner con Google fermo all'orario vecchio.
+//
+// L'autorita' di settle e' ora una sola, la stessa del booking inline.
 
 export type ProcessCalendarSyncResult = {
   candidates: number;
@@ -115,6 +151,8 @@ export class CalendarSyncReconciler {
   constructor(
     private readonly repository: CalendarReconcilerRepository,
     private readonly calendarProvider: CalendarConvergenceProvider,
+    /** Stessa primitiva di intento e settle del booking inline. */
+    private readonly calendarWrites: CalendarWriteStore,
     private readonly options: { defaultLimit?: number } = {},
   ) {}
 
@@ -181,7 +219,35 @@ export class CalendarSyncReconciler {
   ): Promise<'synced' | 'retry' | 'terminal'> {
     // Il tentativo e' gia' stato consumato dalla rivendicazione.
     const attempts = row.attempts + 1;
-    const integration = context?.integration ?? null;
+
+    // SENZA CONTESTO DEL TENANT NON ESISTE NESSUNA EPOCA.
+    //
+    // Qui si arriva quando la lettura del contesto e' fallita o il tenant non
+    // c'e' piu'. La tentazione sarebbe passare `0` alla primitiva e proseguire:
+    // sarebbe un'epoca INVENTATA, cioe' un'autorita' di proiezione che nessuno
+    // ha mai osservato. Se il tenant reale fosse a un'epoca diversa la
+    // primitiva rifiuterebbe comunque, ma un tenant fermo a 0 vedrebbe passare
+    // uno scrittore che non aveva letto niente.
+    //
+    // Quindi: nessun intento, nessuna rete, nessun settle. La rivendicazione ha
+    // gia' consumato il tentativo e scritto il lease su
+    // `calendar_sync_next_attempt_at`, quindi lo scanner rivedra' la riga e la
+    // terminalita' resta un predicato su tentativi e stato, esattamente come
+    // per ogni altro guasto.
+    if (!context) {
+      logger.error(
+        {
+          tenantId: row.tenantId,
+          appointmentId: row.appointmentId,
+          attempt: attempts,
+        },
+        'Calendar sync skipped: the tenant projection authority could not be read',
+      );
+
+      return attempts >= CALENDAR_SYNC_MAX_ATTEMPTS ? 'terminal' : 'retry';
+    }
+
+    const integration = context.integration;
 
     if (!integration) {
       // Il tenant ha scollegato Google mentre c'erano righe in attesa. Non e'
@@ -190,29 +256,68 @@ export class CalendarSyncReconciler {
       // una definitiva diventa terminale, e quindi visibile all'operatore.
       return this.recordFailure(
         row,
+        context,
         new AppError('upstream_error', MISSING_INTEGRATION_ERROR),
         attempts,
         now,
       );
     }
 
+    // L'INTENTO PRIMA DELLA RETE, come nel percorso inline.
+    //
+    // Se la primitiva rifiuta — l'epoca e' avanzata, lo stato desiderato e'
+    // cambiato, la riga non c'e' piu' — Google non viene contattato affatto.
+    // La rivendicazione da sola non basta: e' un lease, non un'autorita'.
+    const opened = await this.calendarWrites.openIntent({
+      tenantId: row.tenantId,
+      appointmentId: row.appointmentId,
+      expectedProjectionEpoch: context.projectionEpoch,
+      expectedDesiredVersion: row.desiredVersion,
+      operation: row.status === 'cancelled' ? 'delete' : 'update',
+      externalEventId: row.calendarEventId,
+      target: reconcilerCalendarTarget(row, integration),
+    });
+
+    if (opened.outcome !== 'opened') {
+      // La riga resta com'era: `calendar_sync_next_attempt_at` e' gia'
+      // valorizzato dalla rivendicazione, quindi lo scanner la rivedra' con lo
+      // stato desiderato AGGIORNATO.
+      logger.info(
+        {
+          tenantId: row.tenantId,
+          appointmentId: row.appointmentId,
+          outcome: opened.outcome,
+        },
+        'Calendar sync skipped: the projection moved before the write was authorized',
+      );
+
+      return 'retry';
+    }
+
+    const budget = createCalendarWriteBudget();
+
     try {
       const converged = await convergeCalendarEvent({
         provider: this.calendarProvider,
         integration,
-        target: buildConvergenceTarget(row, context ?? null),
+        target: buildConvergenceTarget(row, context),
+        budget,
       });
 
-      await this.repository.updateAppointmentCalendarSync({
+      const settled = await this.calendarWrites.settle({
+        ...casFor(opened),
         tenantId: row.tenantId,
         appointmentId: row.appointmentId,
-        status: 'synced',
+        calendarSyncStatus: 'synced',
         eventId: converged.eventId,
+        ...(converged.calendarIdVerified ? { eventCalendarId: converged.calendarId } : {}),
         htmlLink: converged.htmlLink,
         errorMessage: null,
         attempts,
         nextAttemptAt: null,
         lastAttemptAt: now,
+        intentState: 'settled',
+        remoteEvidence: evidenceForAction(converged.action),
       });
 
       logger.info(
@@ -221,35 +326,80 @@ export class CalendarSyncReconciler {
           appointmentId: row.appointmentId,
           attempt: attempts,
           action: converged.action,
+          outcome: settled.outcome,
         },
         'Calendar sync converged',
       );
 
-      return 'synced';
+      // C2. Uno scrittore stantio non puo' dichiarare sincronizzata una riga il
+      // cui stato desiderato e' andato avanti mentre lui era in volo. Il settle
+      // non ha scritto niente, e la proiezione CORRENTE resta — o torna — da
+      // riconciliare.
+      return settled.outcome === 'settled_current' ? 'synced' : 'retry';
     } catch (error) {
-      return this.recordFailure(row, error, attempts, now);
+      return this.recordFailure(row, context, error, attempts, now, opened);
     }
   }
 
+  /**
+   * `context` e' NON opzionale, e non e' un dettaglio di firma.
+   *
+   * Registrare un esito richiede un'autorizzazione, e un'autorizzazione
+   * richiede l'epoca del tenant. Un contesto assente non ha epoca, e il tipo
+   * impedisce di arrivare qui senza: il chiamante deve aver gia' deciso cosa
+   * fare di quel caso, invece di inventarne un valore.
+   */
   private async recordFailure(
     row: DueCalendarSync,
+    context: TenantCalendarContext,
     error: unknown,
     attempts: number,
     now: Date,
+    authorization: CalendarWriteAuthorization | null = null,
   ): Promise<'retry' | 'terminal'> {
     const finalAttempts = isNonRetryableCalendarError(error)
       ? CALENDAR_SYNC_MAX_ATTEMPTS
       : attempts;
     const terminal = finalAttempts >= CALENDAR_SYNC_MAX_ATTEMPTS;
 
-    await this.repository.updateAppointmentCalendarSync({
+    if (!authorization) {
+      // Nessun intento aperto: il guasto e' caduto prima della rete (per
+      // esempio l'integrazione scollegata). Si apre comunque un intento per
+      // poter registrare l'esito sotto la stessa autorita' di tutti gli altri.
+      const opened = await this.calendarWrites.openIntent({
+        tenantId: row.tenantId,
+        appointmentId: row.appointmentId,
+        expectedProjectionEpoch: context.projectionEpoch,
+        expectedDesiredVersion: row.desiredVersion,
+        operation: row.status === 'cancelled' ? 'delete' : 'update',
+        externalEventId: row.calendarEventId,
+        target: null,
+      });
+
+      if (opened.outcome !== 'opened') {
+        return terminal ? 'terminal' : 'retry';
+      }
+
+      authorization = opened;
+    }
+
+    // Timeout e guasti di trasporto lasciano l'esito remoto IGNOTO: la
+    // mutazione puo' essere arrivata. Solo una risposta HTTP di Google prova
+    // che non ha applicato niente.
+    const unknown = isUnknownCalendarWriteOutcome(error);
+
+    await this.calendarWrites.settle({
+      ...casFor(authorization),
       tenantId: row.tenantId,
       appointmentId: row.appointmentId,
-      status: 'failed',
+      calendarSyncStatus: 'failed',
       errorMessage: error instanceof Error ? error.message : 'unknown error',
       attempts: finalAttempts,
       nextAttemptAt: calculateCalendarSyncNextAttemptAt(now, finalAttempts),
       lastAttemptAt: now,
+      intentState: unknown ? 'unknown_outcome' : 'no_remote_mutation',
+      intentErrorCode: calendarWriteErrorCode(error),
+      remoteEvidence: 'none',
     });
 
     // Il corpo dell'errore Google non viene loggato: puo' riportare il payload
@@ -329,7 +479,9 @@ type DueCalendarSyncRow = {
   customer_phone: string | null;
   notes: string | null;
   calendar_event_id: string;
+  calendar_event_calendar_id?: string | null;
   calendar_sync_attempts: number;
+  calendar_desired_version?: number | null;
 };
 
 export class SupabaseCalendarReconcilerRepository implements CalendarReconcilerRepository {
@@ -351,7 +503,7 @@ export class SupabaseCalendarReconcilerRepository implements CalendarReconcilerR
     const { data, error } = await this.supabase
       .from('appointments')
       .select(
-        'id, tenant_id, status, scheduled_at, duration_minutes, service_type, customer_name, customer_phone, notes, calendar_event_id, calendar_sync_attempts',
+        'id, tenant_id, status, scheduled_at, duration_minutes, service_type, customer_name, customer_phone, notes, calendar_event_id, calendar_event_calendar_id, calendar_sync_attempts, calendar_desired_version',
       )
       .eq('calendar_provider', 'google_calendar')
       .in('calendar_sync_status', ['pending', 'failed'])
@@ -380,12 +532,18 @@ export class SupabaseCalendarReconcilerRepository implements CalendarReconcilerR
       customerPhone: row.customer_phone,
       notes: row.notes,
       attempts: row.calendar_sync_attempts,
+      desiredVersion: row.calendar_desired_version ?? 0,
+      calendarEventCalendarId: row.calendar_event_calendar_id ?? null,
     }));
   }
 
   async getTenantCalendarContext(tenantId: string): Promise<TenantCalendarContext | null> {
     const [tenant, config, integrations] = await Promise.all([
-      this.supabase.from('tenants').select('timezone').eq('id', tenantId).maybeSingle(),
+      this.supabase
+        .from('tenants')
+        .select('timezone, projection_epoch')
+        .eq('id', tenantId)
+        .maybeSingle(),
       this.supabase
         .from('tenant_config')
         .select('studio_name, address')
@@ -410,7 +568,10 @@ export class SupabaseCalendarReconcilerRepository implements CalendarReconcilerR
       return null;
     }
 
-    const tenantRow = tenant.data as { timezone: string };
+    const tenantRow = tenant.data as {
+      timezone: string;
+      projection_epoch?: number | string | null;
+    };
     const configRow = config.data as { studio_name: string; address: string | null } | null;
     const integrationRow = (integrations.data?.[0] ?? null) as {
       id: string;
@@ -424,6 +585,7 @@ export class SupabaseCalendarReconcilerRepository implements CalendarReconcilerR
       timezone: tenantRow.timezone || DEFAULT_TIMEZONE,
       studioName: configRow?.studio_name ?? 'Studio',
       address: configRow?.address ?? null,
+      projectionEpoch: Number(tenantRow.projection_epoch ?? 0),
       integration: integrationRow
         ? {
             id: integrationRow.id,
@@ -462,45 +624,6 @@ export class SupabaseCalendarReconcilerRepository implements CalendarReconcilerR
 
     return (data ?? []).length > 0;
   }
-
-  async updateAppointmentCalendarSync(input: {
-    tenantId: string;
-    appointmentId: string;
-    status: CalendarSyncStatus;
-    eventId?: string;
-    htmlLink?: string | null;
-    errorMessage: string | null;
-    attempts: number;
-    nextAttemptAt: Date | null;
-    lastAttemptAt: Date;
-  }): Promise<void> {
-    const patch: Record<string, unknown> = {
-      calendar_sync_status: input.status,
-      calendar_sync_error: input.errorMessage ? input.errorMessage.slice(0, 1000) : null,
-      calendar_sync_attempts: input.attempts,
-      calendar_sync_next_attempt_at: input.nextAttemptAt?.toISOString() ?? null,
-      calendar_sync_last_attempt_at: input.lastAttemptAt.toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-
-    if (input.eventId !== undefined) {
-      patch.calendar_event_id = input.eventId;
-    }
-
-    if (input.htmlLink !== undefined) {
-      patch.calendar_event_html_link = input.htmlLink;
-    }
-
-    const { error } = await this.supabase
-      .from('appointments')
-      .update(patch)
-      .eq('tenant_id', input.tenantId)
-      .eq('id', input.appointmentId);
-
-    if (error) {
-      throw toRepositoryError('Failed to settle appointment calendar sync', error);
-    }
-  }
 }
 
 export function createCalendarSyncReconciler(): CalendarSyncReconciler {
@@ -523,7 +646,27 @@ export function createCalendarSyncReconciler(): CalendarSyncReconciler {
         });
       },
     }),
+    new SupabaseCalendarWriteStore(),
   );
+}
+
+/**
+ * Bersaglio di una convergenza del reconciler.
+ *
+ * Con provenienza memorizzata il bersaglio e' quella, ed e' una prova. Senza,
+ * si ripiega sul calendario configurato adesso — dichiarandolo `current_config`,
+ * cioe' ipotesi. Il ripiego non diventa provenienza per il fatto di essere
+ * stato usato: solo un'osservazione remota positiva puo' promuoverlo.
+ */
+function reconcilerCalendarTarget(
+  row: DueCalendarSync,
+  integration: GoogleCalendarIntegration,
+): CalendarTarget {
+  const stored = row.calendarEventCalendarId?.trim();
+
+  return stored
+    ? { calendarId: stored, identitySource: 'stored_provenance' }
+    : { calendarId: effectiveCalendarId(integration), identitySource: 'current_config' };
 }
 
 function toPlainRecord(value: unknown): Record<string, unknown> {

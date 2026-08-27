@@ -5,6 +5,7 @@
 // dentro ci finissero il cliente o il corpo grezzo di Google, la riga sarebbe
 // contemporaneamente inutile da cercare e rischiosa da conservare.
 
+import { FakeCalendarWriteStore } from '../../fixtures/fake-calendar-write-store';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { logger } from '@/lib/logging/logger';
@@ -101,6 +102,9 @@ function availability(calendar: FakeGoogleCalendar) {
     new StubBookingRepository(),
     calendar,
     new StubNotificationEnqueuer(),
+    // Questi test riguardano solo la LETTURA di disponibilita': nessuna
+    // scrittura autorevole viene esercitata qui.
+    new FakeCalendarWriteStore(),
   );
 
   return service.getAvailableSlots({
@@ -141,12 +145,6 @@ class StubBookingRepository implements AppointmentBookingRepository {
     return [];
   }
 
-  async insertAppointment(): Promise<never> {
-    throw new Error('not used');
-  }
-
-  async updateAppointmentCalendarSync(): Promise<void> {}
-
   async updateGoogleCalendarAccessToken(): Promise<void> {}
 
   async markGoogleAvailabilityError(): Promise<void> {}
@@ -156,10 +154,6 @@ class StubBookingRepository implements AppointmentBookingRepository {
   async getAppointmentForChange() {
     return null;
   }
-
-  async updateAppointmentSchedule(): Promise<void> {}
-
-  async cancelAppointmentRecord(): Promise<void> {}
 }
 
 class StubNotificationEnqueuer implements AppointmentNotificationEnqueuer {

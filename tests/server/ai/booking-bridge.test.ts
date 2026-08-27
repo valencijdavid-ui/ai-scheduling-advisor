@@ -7,6 +7,7 @@ import {
   AVAILABILITY_UNVERIFIABLE_CONFIRMATION_REPLY,
   AVAILABILITY_UNVERIFIABLE_REPLY,
   BookingBridgeService,
+  PROJECTION_FENCE_RETRY_REPLY,
   type BookingBridgeRepository,
   type BookingServiceOption,
   type ConversationBookingState,
@@ -25,7 +26,11 @@ import type {
 } from '@/server/appointments/decision-ledger';
 import { SLOT_RANKING_VERSION } from '@/server/appointments/slot-ranking';
 import { AppError } from '@/lib/errors/app-error';
+import { staleProjectionEpochError } from '@/server/appointments/projection-fence';
 import { CalendarAvailabilityUnavailable } from '@/server/calendar/availability-error';
+
+/** Epoca di proiezione osservata dal turno in ognuno di questi test. */
+const TURN_EPOCH = 7;
 
 const occurredAt = new Date('2026-04-27T07:00:00.000Z');
 
@@ -1121,6 +1126,7 @@ function rescheduleConfirmationHarness() {
 }
 
 class FakeBookingBridgeRepository implements BookingBridgeRepository {
+  clearedStates = 0;
   savedState: ConversationBookingState | null = null;
   cleared = false;
   appointments: CustomerAppointmentForBridge[] = [];
@@ -1147,6 +1153,7 @@ class FakeBookingBridgeRepository implements BookingBridgeRepository {
   async clearConversationBookingState(): Promise<void> {
     this.savedState = null;
     this.cleared = true;
+    this.clearedStates += 1;
   }
 
   async listCustomerAppointments(): Promise<CustomerAppointmentForBridge[]> {
@@ -1166,6 +1173,102 @@ class FakeSchedulingDecisionLedger implements SchedulingDecisionLedger {
     this.records.push(input);
   }
 }
+
+describe('PILOT-P0-3C-i — degradazione del turno rifiutato dal fence', () => {
+  // Il fence rifiuta quando il turno era partito sotto un'autorita' che nel
+  // frattempo e' cambiata — nel caso che conta, perche' i dati del cliente
+  // sono stati cancellati. La risposta deve essere deterministica e chiedere
+  // un GESTO NUOVO: ritentare per conto proprio significherebbe riproiettare,
+  // sotto l'autorita' nuova, la PII che il turno vecchio si portava dietro.
+
+  it('asks for a new user turn instead of replaying the booking confirmation', async () => {
+    const repository = new FakeBookingBridgeRepository(bridgeServices());
+    repository.savedState = stateWithSlots();
+    const booking = new FakeAppointmentBookingService();
+    booking.createError = staleProjectionEpochError();
+
+    const service = new BookingBridgeService(
+      repository,
+      booking as unknown as AppointmentBookingService,
+    );
+
+    const reply = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+    expect(reply.handled).toBe(true);
+    expect(reply.replyText).toBe(PROJECTION_FENCE_RETRY_REPLY);
+    expect(reply.metadata).toMatchObject({
+      bookingBridge: { action: 'projection_fence_rejected' },
+    });
+
+    // Un solo tentativo: nessun replay automatico del turno vecchio.
+    expect(booking.createCalls).toHaveLength(1);
+
+    // E lo stato della proposta viene azzerato, cosi' il cliente non puo'
+    // riconfermare uno slot che apparteneva a un turno senza autorita'.
+    expect(repository.clearedStates).toBe(1);
+  });
+
+  it('never reports the fence rejection as a taken slot', async () => {
+    // Entrambi sono `conflict`. Se l'ordine dei rami fosse sbagliato, il
+    // cliente riceverebbe una spiegazione FALSA — "quello slot non e' piu'
+    // disponibile" — di un fatto completamente diverso.
+    const repository = new FakeBookingBridgeRepository(bridgeServices());
+    repository.savedState = stateWithSlots();
+    const booking = new FakeAppointmentBookingService();
+    booking.createError = staleProjectionEpochError();
+
+    const service = new BookingBridgeService(
+      repository,
+      booking as unknown as AppointmentBookingService,
+    );
+
+    const reply = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+    expect(reply.replyText).not.toMatch(/non risulta piu disponibile/i);
+    expect(reply.metadata).not.toMatchObject({ bookingBridge: { action: 'slot_conflict' } });
+  });
+
+  it('degrades the cancellation turn too, without reporting a cancellation', async () => {
+    const repository = new FakeBookingBridgeRepository(bridgeServices());
+    repository.appointments = [customerAppointment({ appointmentId: 'appointment_1' })];
+    const booking = new FakeAppointmentBookingService();
+    booking.cancelError = staleProjectionEpochError();
+
+    const service = new BookingBridgeService(
+      repository,
+      booking as unknown as AppointmentBookingService,
+    );
+
+    const reply = await service.createBookingReply({
+      ...baseInput(),
+      text: 'Annulla appuntamento',
+      intent: 'cancellation_request',
+    });
+
+    expect(reply.replyText).toBe(PROJECTION_FENCE_RETRY_REPLY);
+    // Non deve MAI dire "ho annullato" per un annullamento che non e' avvenuto.
+    expect(reply.replyText).not.toMatch(/ho annullato/i);
+  });
+
+  it('leaks no epoch numbers to the customer', async () => {
+    const repository = new FakeBookingBridgeRepository(bridgeServices());
+    repository.savedState = stateWithSlots();
+    const booking = new FakeAppointmentBookingService();
+    booking.createError = staleProjectionEpochError();
+
+    const service = new BookingBridgeService(
+      repository,
+      booking as unknown as AppointmentBookingService,
+    );
+
+    const reply = await service.createBookingReply({ ...baseInput(), text: 'confermo 1' });
+
+    // L'epoca e' stato interno del fence: non significa niente per chi scrive,
+    // e nominarla esporrebbe il ritmo delle cancellazioni del tenant.
+    expect(reply.replyText).not.toMatch(/epoch|epoca|\d{2,}/i);
+    expect(JSON.stringify(reply.metadata)).not.toMatch(/projectionEpoch/);
+  });
+});
 
 class FakeAppointmentBookingService {
   availabilityCalls: Array<{
@@ -1229,8 +1332,15 @@ class FakeAppointmentBookingService {
     return { appointmentId: input.appointmentId };
   }
 
+  cancelError: Error | null = null;
+
   async cancelAppointment(input: CancelAppointmentInput): Promise<{ appointmentId: string }> {
     this.cancelCalls.push(input);
+
+    if (this.cancelError) {
+      throw this.cancelError;
+    }
+
     return { appointmentId: input.appointmentId };
   }
 }
@@ -1238,6 +1348,10 @@ class FakeAppointmentBookingService {
 function baseInput() {
   return {
     tenantId: 'tenant_1',
+    // Epoca catturata al confine del turno WhatsApp. Il servizio finto sotto
+    // vive sulla stessa epoca: e' il caso normale, quello in cui l'autorita'
+    // non e' cambiata durante il turno.
+    expectedProjectionEpoch: TURN_EPOCH,
     conversationId: 'conversation_1',
     customerIdentifier: '393331112233',
     customerName: null,
@@ -1253,6 +1367,10 @@ function serviceOption(id: string, name: string): BookingServiceOption {
     durationMinutes: 30,
     priceCents: null,
   };
+}
+
+function bridgeServices(): BookingServiceOption[] {
+  return [serviceOption('service_1', 'Prima visita')];
 }
 
 function stateWithSlots(): ConversationBookingState {

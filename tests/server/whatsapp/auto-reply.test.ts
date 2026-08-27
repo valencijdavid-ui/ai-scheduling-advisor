@@ -159,6 +159,7 @@ describe('WhatsAppAutoReplyService', () => {
 function baseInput() {
   return {
     tenantId: 'tenant_1',
+    expectedProjectionEpoch: 0,
     conversationId: 'conversation_1',
     inboundMessageId: 'message_1',
     inboundExternalId: 'message:wamid.audio',

@@ -14,6 +14,10 @@ import {
   SupabaseWhatsAppWebhookRepository,
   type WhatsAppWebhookRepository,
 } from '@/server/whatsapp/repository';
+import {
+  createProjectionFenceReader,
+  type ProjectionFenceReader,
+} from '@/server/appointments/projection-fence';
 
 export type ProcessWhatsAppWebhookContext = {
   requestId: string;
@@ -34,6 +38,8 @@ export class WhatsAppWebhookService {
   // Fatto da Claude Code 2026-04-27: usage limits opzionale per conteggio
   // conversazioni mensili. I test esistenti continuano a passare null.
   private readonly usageLimits: UsageLimitsService | null;
+  private readonly injectedFence: ProjectionFenceReader | null;
+  private lazyFence: ProjectionFenceReader | undefined;
 
   constructor(
     private readonly repository: WhatsAppWebhookRepository,
@@ -42,6 +48,7 @@ export class WhatsAppWebhookService {
       replyOrchestrator?: ReplyOrchestrator;
       autoReplyService?: WhatsAppAutoReplyService;
       usageLimits?: UsageLimitsService;
+      projectionFence?: ProjectionFenceReader;
     } = {},
   ) {
     this.autoReplyService =
@@ -53,6 +60,19 @@ export class WhatsAppWebhookService {
           : {}),
       });
     this.usageLimits = options.usageLimits ?? null;
+    this.injectedFence = options.projectionFence ?? null;
+  }
+
+  /**
+   * Costruito alla prima lettura, non nel costruttore.
+   *
+   * Il lettore reale apre un client Supabase, che pretende le credenziali di
+   * servizio. Costruirlo comunque renderebbe impossibile istanziare il
+   * servizio nei percorsi che non arrivano mai a un turno inbound — ed e' una
+   * dipendenza che quei percorsi non usano.
+   */
+  private get projectionFence(): ProjectionFenceReader {
+    return (this.lazyFence ??= this.injectedFence ?? createProjectionFenceReader());
   }
 
   async processPayload(
@@ -179,6 +199,22 @@ export class WhatsAppWebhookService {
     event: Extract<WhatsAppWebhookEvent, { kind: 'message' }>,
     tenantId: string,
   ): Promise<void> {
+    // CATTURA PRECOCE DELL'EPOCA DI PROIEZIONE (PILOT-P0-3C-i).
+    //
+    // Qui, e non piu' in basso: il tenant e' noto, e NIENTE dello stato del
+    // cliente e' ancora stato letto — non la conversazione, non i messaggi,
+    // non gli appuntamenti. Da questo istante in poi il turno trattiene dati
+    // del cliente, e l'autorita' sotto cui lo fa e' quella osservata ADESSO.
+    //
+    // Leggerla piu' tardi, appena prima della scrittura, sarebbe il difetto:
+    // un turno cominciato prima di una cancellazione leggerebbe l'epoca NUOVA
+    // e la adotterebbe, riproiettando su Google il nome e il telefono che
+    // tiene in memoria da minuti — sotto un'autorita' che era stata revocata
+    // proprio per distruggerli.
+    //
+    // Il valore non viene mai rinfrescato per il resto del turno.
+    const projection = await this.projectionFence.capture(tenantId);
+
     const conversation = await this.repository.upsertConversation({
       tenantId,
       channel: 'whatsapp',
@@ -264,6 +300,7 @@ export class WhatsAppWebhookService {
 
         await this.autoReplyService.handleInboundMessage({
           tenantId,
+          expectedProjectionEpoch: projection.projectionEpoch,
           conversationId: conversation.conversationId,
           inboundMessageId: inserted.messageId,
           inboundExternalId: event.externalId,

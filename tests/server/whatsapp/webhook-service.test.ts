@@ -1,3 +1,4 @@
+import { FakeProjectionFenceReader } from '../../fixtures/fake-projection-fence';
 import { describe, expect, it } from 'vitest';
 
 import { AppError } from '@/lib/errors/app-error';
@@ -38,7 +39,9 @@ describe('WhatsAppWebhookService', () => {
       integrationId: 'integration_1',
       tenantId: 'tenant_1',
     });
-    const service = new WhatsAppWebhookService(repository);
+    const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
     const payload = textPayload('wamid.1');
 
     const first = await service.processPayload(payload, context);
@@ -64,7 +67,9 @@ describe('WhatsAppWebhookService', () => {
 
   it('records unresolved tenants without throwing to the webhook provider', async () => {
     const repository = new FakeWhatsAppWebhookRepository();
-    const service = new WhatsAppWebhookService(repository);
+    const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
 
     const result = await service.processPayload(textPayload('wamid.2'), context);
 
@@ -75,7 +80,9 @@ describe('WhatsAppWebhookService', () => {
 
   it('rejects payloads without messages or statuses', async () => {
     const repository = new FakeWhatsAppWebhookRepository();
-    const service = new WhatsAppWebhookService(repository);
+    const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
     const payload = WhatsAppWebhookPayloadSchema.parse({
       object: 'whatsapp_business_account',
       entry: [
@@ -109,7 +116,9 @@ describe('WhatsAppWebhookService', () => {
       tenantId: 'tenant_1',
     });
     repository.failNextMessageInsert = true;
-    const service = new WhatsAppWebhookService(repository);
+    const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
 
     await expect(service.processPayload(textPayload('wamid.3'), context)).rejects.toMatchObject({
       code: 'upstream_error',
@@ -131,6 +140,7 @@ describe('WhatsAppWebhookService', () => {
       defaultLocale: 'it-IT',
     });
     const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
       autoReplyEnabled: true,
     });
 
@@ -176,6 +186,7 @@ describe('WhatsAppWebhookService', () => {
     });
     repository.optOuts.add('tenant_1:whatsapp:393331112233');
     const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
       autoReplyEnabled: true,
     });
 
@@ -194,7 +205,9 @@ describe('WhatsAppWebhookService', () => {
       integrationId: 'integration_1',
       tenantId: 'tenant_1',
     });
-    const service = new WhatsAppWebhookService(repository);
+    const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
 
     const result = await service.processPayload(audioPayload('wamid.audio'), context);
 
@@ -226,6 +239,7 @@ describe('WhatsAppWebhookService', () => {
       defaultLocale: 'it-IT',
     });
     const service = new WhatsAppWebhookService(repository, {
+      projectionFence: new FakeProjectionFenceReader(),
       autoReplyEnabled: true,
     });
 

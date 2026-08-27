@@ -1,18 +1,14 @@
-// PILOT-P0-3C — CARATTERIZZAZIONE. Il collasso dell'esito di una DELETE.
+// PILOT-P0-3C-i — REGRESSIONE. L'esito di una DELETE resta distinguibile.
 //
-// `cancelEvent` tratta 200, 204, 404 e 410 come lo stesso esito. La
-// distinzione fra "ho cancellato un evento che esisteva" e "non c'era
-// niente" viene DISTRUTTA sul confine del provider, prima che qualunque
-// chiamante possa vederla.
+// Questo file nasce in P0-3C come CARATTERIZZAZIONE: `cancelEvent` trattava
+// 200, 204, 404 e 410 come lo stesso esito, e i test affermavano la perdita.
+// C-i ripara il difetto (C6), quindi le stesse scene restano ma le asserzioni
+// si rovesciano: da "l'informazione e' persa" a "l'informazione c'e'".
 //
-// Perche' e' load-bearing per P0-3C: un worker che converge le obbligazioni
-// deve poter scrivere `converged` solo su prove. Se manda la DELETE al
-// calendario sbagliato — cosa possibile finche'
-// `appointments.calendar_event_calendar_id` non e' popolata — riceve 404, che
-// oggi vale successo, e chiude un debito il cui evento, con dentro il telefono
-// del cliente, e' vivo altrove.
-//
-// Il test resta verde affermando la perdita di informazione.
+// Perche' e' load-bearing: un worker che converge le obbligazioni puo'
+// scrivere `converged` solo su prove. Se manda la DELETE al calendario
+// sbagliato riceve 404 — e se 404 valesse "fatto" chiuderebbe un debito il cui
+// evento, con dentro il telefono del cliente, e' vivo altrove.
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -22,8 +18,8 @@ import {
   type CalendarConvergenceTarget,
 } from '@/server/appointments/calendar-convergence';
 
-describe('PILOT-P0-3C — caratterizzazione dell esito di cancelEvent', () => {
-  it('characterizes 204, 404 and 410 collapsing into one indistinguishable result', async () => {
+describe('PILOT-P0-3C-i — esito di cancelEvent', () => {
+  it('separates 204 from 404 and 410 instead of collapsing them', async () => {
     const outcomes = await Promise.all(
       [204, 404, 410].map(async (status) => {
         const provider = new GoogleCalendarProvider({
@@ -37,28 +33,28 @@ describe('PILOT-P0-3C — caratterizzazione dell esito di cancelEvent', () => {
     const [deleted, absent, gone] = outcomes;
 
     // 204 = l'evento c'era e non c'e' piu'.
-    // 404 = non c'era, o non e' su QUESTO calendario.
-    // 410 = c'era ed era gia' stato eliminato.
-    //
-    // Tre fatti diversi, un valore solo.
-    expect(deleted).toEqual({ cancelled: true });
-    expect(absent).toEqual({ cancelled: true });
-    expect(gone).toEqual({ cancelled: true });
-    expect(deleted).toEqual(absent);
-    expect(absent).toEqual(gone);
+    expect(deleted).toEqual({
+      outcome: 'deleted',
+      calendarId: 'studio@example.com',
+      httpStatus: 204,
+    });
 
-    // Non c'e' nessun campo aggiuntivo da cui dedurre l'esito: la superficie
-    // di ritorno e' esattamente una chiave.
-    for (const outcome of outcomes) {
-      expect(Object.keys(outcome as object)).toEqual(['cancelled']);
-    }
+    // 404/410 = non c'era SU QUESTO CALENDARIO. Non e' una cancellazione.
+    expect(absent).toMatchObject({ outcome: 'already_absent', httpStatus: 404 });
+    expect(gone).toMatchObject({ outcome: 'already_absent', httpStatus: 410 });
 
-    // DELETE_ABSENCE_INFORMATION_LOST = TRUE
+    // Il fatto positivo non e' piu' confondibile con i due negativi...
+    expect(deleted).not.toEqual(absent);
+    expect(deleted).not.toEqual(gone);
+
+    // ...e lo status HTTP resta leggibile, cosi' che 404 e 410 restino
+    // distinguibili fra loro per chi dovra' deciderne il significato.
+    expect(outcomes.map((outcome) => outcome.httpStatus)).toEqual([204, 404, 410]);
   });
 
-  it('characterizes the convergence result being identical whether or not anything was deleted', async () => {
-    // La perdita non si ferma al provider: risale invariata fino all'esito
-    // della convergenza, che e' cio' che il reconciler registra in Postgres.
+  it('keeps the convergence result different when nothing was actually deleted', async () => {
+    // La distinzione non si ferma al provider: risale fino all'esito della
+    // convergenza, che e' cio' che il reconciler registra in Postgres.
     const target: CalendarConvergenceTarget = {
       tenantId: 'tenant_1',
       appointmentId: '3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f607',
@@ -82,15 +78,16 @@ describe('PILOT-P0-3C — caratterizzazione dell esito di cancelEvent', () => {
     const afterRealDelete = await converge(204);
     const afterMissingEvent = await converge(404);
 
-    expect(afterRealDelete).toEqual(afterMissingEvent);
-    // `deleted` viene riportato anche quando non e' stato cancellato niente.
-    expect(afterMissingEvent.action).toBe('deleted');
+    expect(afterRealDelete).not.toEqual(afterMissingEvent);
+    expect(afterRealDelete.action).toBe('deleted');
+    expect(afterMissingEvent.action).toBe('already_absent');
+
+    // Solo una cancellazione riuscita dimostra che l'evento viveva li'.
+    expect(afterRealDelete.calendarIdVerified).toBe(true);
+    expect(afterMissingEvent.calendarIdVerified).toBe(false);
   });
 
-  it('contrasts getEvent, which does preserve absence', async () => {
-    // Il contrasto e' la prova che l'informazione ESISTE a livello HTTP ed e'
-    // gia' leggibile altrove nello stesso file di produzione: e' `cancelEvent`
-    // a buttarla via, non Google a non fornirla.
+  it('still preserves absence on getEvent, as it always did', async () => {
     const missing = new GoogleCalendarProvider({
       fetcher: vi.fn(async () => new Response(null, { status: 404 })),
     });
@@ -117,11 +114,11 @@ describe('PILOT-P0-3C — caratterizzazione dell esito di cancelEvent', () => {
     ).resolves.toMatchObject({ eventId: 'apt_1', status: 'confirmed' });
   });
 
-  it('characterizes cancelEvent targeting whatever calendar the current config names', async () => {
-    // L'altra meta' del difetto: il calendario non e' un parametro
-    // dell'obbligazione ma una lettura della configurazione CORRENTE. Se il
-    // tenant ha cambiato calendario, la DELETE parte per l'indirizzo
-    // sbagliato — e il 404 che ne segue vale successo.
+  it('reports which calendar it contacted, and refuses to call an absence a deletion', async () => {
+    // L'altra meta' del difetto: senza provenienza memorizzata la DELETE parte
+    // per il calendario CONFIGURATO ADESSO. Se il tenant l'ha cambiato,
+    // l'evento storico vive altrove — e il 404 che ne segue ora dice
+    // esattamente questo, invece di dire "fatto".
     const fetcher = vi.fn(
       async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(null, { status: 404 }),
     );
@@ -135,9 +132,39 @@ describe('PILOT-P0-3C — caratterizzazione dell esito di cancelEvent', () => {
     expect(String(fetcher.mock.calls[0]?.[0])).toContain(
       encodeURIComponent('calendario-nuovo@example.com'),
     );
-    // L'evento storico vive su un altro calendario, e questo esito dice
-    // comunque "fatto".
-    expect(outcome).toEqual({ cancelled: true });
+    expect(outcome).toEqual({
+      outcome: 'already_absent',
+      calendarId: 'calendario-nuovo@example.com',
+      httpStatus: 404,
+    });
+  });
+
+  it('sends the DELETE to the stored provenance, not to the calendar configured now', async () => {
+    // La riparazione del bersaglio: un `calendarId` esplicito e' la
+    // provenienza verificata dell'evento e vince sulla configurazione
+    // corrente, che nel frattempo puo' essere cambiata.
+    const fetcher = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(null, { status: 204 }),
+    );
+    const provider = new GoogleCalendarProvider({ fetcher });
+
+    const outcome = await provider.cancelEvent({
+      integration: integration({ config: { calendar_id: 'calendario-nuovo@example.com' } }),
+      eventId: 'apt_1',
+      calendarId: 'calendario-storico@example.com',
+    });
+
+    expect(String(fetcher.mock.calls[0]?.[0])).toContain(
+      encodeURIComponent('calendario-storico@example.com'),
+    );
+    expect(String(fetcher.mock.calls[0]?.[0])).not.toContain(
+      encodeURIComponent('calendario-nuovo@example.com'),
+    );
+    expect(outcome).toEqual({
+      outcome: 'deleted',
+      calendarId: 'calendario-storico@example.com',
+      httpStatus: 204,
+    });
   });
 });
 

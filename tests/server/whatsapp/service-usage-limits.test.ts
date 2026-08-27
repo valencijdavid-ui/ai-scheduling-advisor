@@ -2,6 +2,7 @@
 // usageLimits hook (registerInboundConversation), status delivery events,
 // payload vuoto. Usa fake repository minimal che soddisfa l'interfaccia.
 
+import { FakeProjectionFenceReader } from '../../fixtures/fake-projection-fence';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -39,7 +40,9 @@ describe('WhatsAppWebhookService.processPayload (edge cases)', () => {
   it('rejects payload that produces zero processable events', async () => {
     // Arrange: payload Zod-valido ma con entry vuoto -> nessun evento estraibile
     const repo = new MinimalRepo();
-    const service = new WhatsAppWebhookService(repo);
+    const service = new WhatsAppWebhookService(repo, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
     const emptyPayload = WhatsAppWebhookPayloadSchema.parse({
       object: 'whatsapp_business_account',
       entry: [],
@@ -55,7 +58,9 @@ describe('WhatsAppWebhookService.processPayload (edge cases)', () => {
     // Arrange
     const repo = new MinimalRepo();
     // tenants vuoto: nessuna risoluzione
-    const service = new WhatsAppWebhookService(repo);
+    const service = new WhatsAppWebhookService(repo, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
 
     // Act
     const result = await service.processPayload(textPayload('wamid.unresolved'), ctx);
@@ -73,7 +78,9 @@ describe('WhatsAppWebhookService.processPayload (edge cases)', () => {
     // Arrange
     const repo = new MinimalRepo();
     repo.tenants.set('phone_123', { integrationId: 'int_1', tenantId: 'tenant_1' });
-    const service = new WhatsAppWebhookService(repo);
+    const service = new WhatsAppWebhookService(repo, {
+      projectionFence: new FakeProjectionFenceReader(),
+    });
 
     // Act
     const result = await service.processPayload(statusPayload('wamid.status', 'delivered'), ctx);
@@ -97,6 +104,7 @@ describe('WhatsAppWebhookService.processPayload (usageLimits hook)', () => {
     // Il service utilizza solo registerInboundConversation: castiamo con
     // helper tipato per evitare `any`.
     const service = new WhatsAppWebhookService(repo, {
+      projectionFence: new FakeProjectionFenceReader(),
       // eslint-disable-next-line no-restricted-syntax -- fake con sola superficie usata dal service
       usageLimits: usageLimits as unknown as UsageLimitsService,
     });
@@ -122,6 +130,7 @@ describe('WhatsAppWebhookService.processPayload (usageLimits hook)', () => {
       registerInboundConversation: vi.fn(async () => ({ counted: true })),
     };
     const service = new WhatsAppWebhookService(repo, {
+      projectionFence: new FakeProjectionFenceReader(),
       usageLimits: usageLimits as any,
     });
 

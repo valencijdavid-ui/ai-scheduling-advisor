@@ -132,6 +132,7 @@ describe('convergeCalendarEvent', () => {
     const google = new FakeGoogleCalendar();
     google.events.set(EVENT_ID, {
       id: EVENT_ID,
+      calendarId: 'primary',
       status: 'cancelled',
       start: new Date('2026-04-27T09:00:00.000Z'),
       end: new Date('2026-04-27T09:30:00.000Z'),
@@ -187,6 +188,7 @@ describe('convergeCalendarEvent', () => {
     };
     google.events.set(EVENT_ID, {
       id: EVENT_ID,
+      calendarId: 'primary',
       status: 'confirmed',
       start: new Date('2026-04-27T09:00:00.000Z'),
       end: new Date('2026-04-27T09:30:00.000Z'),
@@ -205,7 +207,7 @@ describe('convergeCalendarEvent', () => {
     expect(google.activeEvents()).toHaveLength(1);
   });
 
-  it('deletes the event for a cancelled appointment and tolerates it being gone', async () => {
+  it('deletes the event for a cancelled appointment and calls the second pass absent', async () => {
     const google = new FakeGoogleCalendar();
     await convergeCalendarEvent({ provider: google, integration, target: target() });
 
@@ -221,8 +223,17 @@ describe('convergeCalendarEvent', () => {
       target: cancelled,
     });
 
+    // La prima passata cancella un evento che c'era. La seconda non cancella
+    // niente: e' idempotente, ma non e' lo STESSO fatto, e chiamarlo `deleted`
+    // significherebbe registrare una cancellazione mai avvenuta.
     expect(first.action).toBe('deleted');
-    expect(second.action).toBe('deleted');
+    expect(first.calendarIdVerified).toBe(true);
+
+    expect(second.action).toBe('already_absent');
+    // Un'assenza non promuove il calendario contattato a provenienza: da qui
+    // non si distingue "non esiste" da "non e' su QUESTO calendario".
+    expect(second.calendarIdVerified).toBe(false);
+
     expect(google.activeEvents()).toHaveLength(0);
   });
 

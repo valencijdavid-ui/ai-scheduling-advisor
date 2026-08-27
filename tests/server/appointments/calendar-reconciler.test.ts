@@ -13,6 +13,7 @@ import {
   type TenantCalendarContext,
 } from '@/server/appointments/calendar-reconciler';
 import type { CalendarSyncStatus } from '@/server/appointments/booking';
+import { FakeCalendarWriteStore } from '../../fixtures/fake-calendar-write-store';
 import { FakeGoogleCalendar, googleError } from '../../fixtures/fake-google-calendar';
 
 const APPOINTMENT_ID = '3f2a1b4c-5d6e-4f70-8a91-b2c3d4e5f607';
@@ -24,7 +25,7 @@ describe('CalendarSyncReconciler', () => {
     const repository = new FakeReconcilerRepository();
     repository.seed(dueRow());
     const google = new FakeGoogleCalendar();
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     const result = await reconciler.processDueSyncs({ now });
 
@@ -46,13 +47,14 @@ describe('CalendarSyncReconciler', () => {
     const google = new FakeGoogleCalendar();
     google.events.set(EVENT_ID, {
       id: EVENT_ID,
+      calendarId: 'primary',
       status: 'confirmed',
       start: new Date('2026-05-27T09:00:00.000Z'),
       end: new Date('2026-05-27T09:30:00.000Z'),
       summary: 'Studio: Prima visita - Mario Rossi',
       htmlLink: 'https://calendar.google.com/event?eid=x',
     });
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     await reconciler.processDueSyncs({ now });
 
@@ -67,13 +69,14 @@ describe('CalendarSyncReconciler', () => {
     const google = new FakeGoogleCalendar();
     google.events.set(EVENT_ID, {
       id: EVENT_ID,
+      calendarId: 'primary',
       status: 'confirmed',
       start: new Date('2026-05-27T09:00:00.000Z'),
       end: new Date('2026-05-27T09:30:00.000Z'),
       summary: 'Studio: Prima visita - Mario Rossi',
       htmlLink: 'https://calendar.google.com/event?eid=x',
     });
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     await reconciler.processDueSyncs({ now });
 
@@ -87,8 +90,8 @@ describe('CalendarSyncReconciler', () => {
     const repository = new FakeReconcilerRepository();
     repository.seed(dueRow());
     const google = new FakeGoogleCalendar();
-    const first = new CalendarSyncReconciler(repository, google);
-    const second = new CalendarSyncReconciler(repository, google);
+    const first = new CalendarSyncReconciler(repository, google, repository.writes);
+    const second = new CalendarSyncReconciler(repository, google, repository.writes);
 
     // Entrambi leggono la stessa riga prima che l'altro la rivendichi.
     const [a, b] = await Promise.all([
@@ -105,7 +108,7 @@ describe('CalendarSyncReconciler', () => {
     const repository = new FakeReconcilerRepository();
     repository.seed(dueRow());
     const google = new FakeGoogleCalendar();
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     // Il worker rivendica e poi muore: nessuna scrittura di esito.
     const claimed = await repository.claimCalendarSync({
@@ -133,7 +136,7 @@ describe('CalendarSyncReconciler', () => {
     repository.seed(dueRow());
     const google = new FakeGoogleCalendar();
     google.getError = googleError(503, 'Service Unavailable');
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     let clock = now;
     for (let round = 0; round < CALENDAR_SYNC_MAX_ATTEMPTS + 2; round += 1) {
@@ -158,7 +161,7 @@ describe('CalendarSyncReconciler', () => {
     repository.seed(dueRow());
     const google = new FakeGoogleCalendar();
     google.getError = googleError(401, 'Invalid Credentials');
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     const result = await reconciler.processDueSyncs({ now });
 
@@ -175,7 +178,7 @@ describe('CalendarSyncReconciler', () => {
     // frequenza non deve consumare in un colpo solo tutto il budget e
     // chiamare un operatore.
     google.getError = googleError(403, 'Rate Limit Exceeded');
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     const result = await reconciler.processDueSyncs({ now });
 
@@ -195,7 +198,7 @@ describe('CalendarSyncReconciler', () => {
     repository.seed(dueRow());
     const google = new FakeGoogleCalendar();
     google.getError = googleError(403, 'Rate Limit Exceeded');
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     await reconciler.processDueSyncs({ now });
 
@@ -213,7 +216,11 @@ describe('CalendarSyncReconciler', () => {
     const repository = new FakeReconcilerRepository();
     repository.seed(dueRow());
     repository.context = { ...repository.context, integration: null };
-    const reconciler = new CalendarSyncReconciler(repository, new FakeGoogleCalendar());
+    const reconciler = new CalendarSyncReconciler(
+      repository,
+      new FakeGoogleCalendar(),
+      repository.writes,
+    );
 
     const result = await reconciler.processDueSyncs({ now });
 
@@ -223,6 +230,40 @@ describe('CalendarSyncReconciler', () => {
     expect(repository.state(APPOINTMENT_ID)).toMatchObject({ status: 'failed', attempts: 1 });
   });
 
+  it('never invents a projection epoch when the tenant context cannot be read', async () => {
+    // PILOT-P0-3C-i. Senza contesto del tenant non esiste nessuna epoca, e
+    // l'unica alternativa a fermarsi sarebbe passarne una INVENTATA — cioe'
+    // un'autorita' di proiezione che nessuno ha mai osservato. Su un tenant
+    // fermo a 0 quel valore combacerebbe, e lo scrittore passerebbe il fence
+    // senza aver letto niente.
+    const repository = new FakeReconcilerRepository();
+    repository.seed(dueRow());
+    repository.contextFailure = true;
+
+    const google = new FakeGoogleCalendar();
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
+
+    const result = await reconciler.processDueSyncs({ now });
+
+    // La riga e' stata rivendicata — il tentativo e' consumato e il lease e'
+    // scritto — ma il giro si ferma li'.
+    expect(result).toMatchObject({ claimed: 1, synced: 0, retried: 1 });
+
+    // NESSUNA autorizzazione chiesta: niente intento, quindi niente epoca
+    // inventata da confrontare.
+    expect(repository.writes.openedIntents).toEqual([]);
+    expect(repository.writes.settles).toEqual([]);
+
+    // E ZERO mutazioni remote, in ogni verso.
+    expect(google.insertCount).toBe(0);
+    expect(google.patchCount).toBe(0);
+    expect(google.deleteCount).toBe(0);
+
+    // La riga resta recuperabile: il lease della rivendicazione la riporta
+    // davanti allo scanner al tick successivo.
+    expect(repository.state(APPOINTMENT_ID)?.nextAttemptAt).not.toBeNull();
+  });
+
   it('ignores rows the scanner predicate excludes', async () => {
     const repository = new FakeReconcilerRepository();
     // Riga storica senza identita': mai riconciliata in automatico.
@@ -230,7 +271,7 @@ describe('CalendarSyncReconciler', () => {
     // Riga gia' terminale.
     repository.seed(dueRow({ appointmentId: 'other', attempts: CALENDAR_SYNC_MAX_ATTEMPTS }));
     const google = new FakeGoogleCalendar();
-    const reconciler = new CalendarSyncReconciler(repository, google);
+    const reconciler = new CalendarSyncReconciler(repository, google, repository.writes);
 
     const result = await reconciler.processDueSyncs({ now });
 
@@ -258,10 +299,14 @@ type ReconcilerState = {
  */
 class FakeReconcilerRepository implements CalendarReconcilerRepository {
   readonly states = new Map<string, ReconcilerState>();
+  readonly writes = new FakeCalendarWriteStore();
+  /** `true` modella il contesto del tenant illeggibile: nessuna epoca. */
+  contextFailure = false;
   context: TenantCalendarContext = {
     timezone: 'Europe/Rome',
     studioName: 'Studio Ambrogio',
     address: 'Via Roma 1',
+    projectionEpoch: 0,
     integration: {
       id: 'integration_1',
       tenantId: 'tenant_1',
@@ -284,10 +329,58 @@ class FakeReconcilerRepository implements CalendarReconcilerRepository {
       eventId: options.withoutIdentity ? null : row.calendarEventId,
       error: null,
     });
+
+    // La riga autorevole vive nella primitiva di scrittura, non qui: e' quella
+    // che il reconciler deve interrogare per sapere se ha ancora il diritto di
+    // scrivere l'esito.
+    this.writes.rows.set(row.appointmentId, {
+      id: row.appointmentId,
+      tenantId: row.tenantId,
+      conversationId: null,
+      serviceId: 'service_1',
+      serviceName: row.serviceName,
+      customerIdentifier: '393331112233',
+      customerName: row.customerName,
+      customerPhone: row.customerPhone,
+      scheduledAt: row.scheduledAt,
+      durationMinutes: row.durationMinutes,
+      status: row.status === 'cancelled' ? 'cancelled' : 'confirmed',
+      calendarProvider: 'google_calendar',
+      calendarSyncStatus: 'pending',
+      calendarEventId: options.withoutIdentity ? null : row.calendarEventId,
+      calendarEventCalendarId: row.calendarEventCalendarId,
+      calendarEventHtmlLink: null,
+      notes: row.notes,
+      calendarSyncError: null,
+      calendarSyncAttempts: row.attempts,
+      calendarSyncNextAttemptAt: now,
+      calendarSyncLastAttemptAt: null,
+      desiredVersion: row.desiredVersion,
+      writeGeneration: 0,
+    });
+    this.writes.projectionEpoch = this.context.projectionEpoch;
   }
 
   state(appointmentId: string): ReconcilerState | undefined {
-    return this.states.get(appointmentId);
+    const scanner = this.states.get(appointmentId);
+    const authoritative = this.writes.rows.get(appointmentId);
+
+    if (!scanner) {
+      return undefined;
+    }
+
+    // Lo stato osservabile e' quello scritto dal SETTLE, non quello che il
+    // worker credeva di aver scritto.
+    return authoritative
+      ? {
+          ...scanner,
+          status: authoritative.calendarSyncStatus,
+          attempts: authoritative.calendarSyncAttempts,
+          nextAttemptAt: authoritative.calendarSyncNextAttemptAt,
+          eventId: authoritative.calendarEventId,
+          error: authoritative.calendarSyncError,
+        }
+      : scanner;
   }
 
   async listDueCalendarSyncs(input: { now: Date; limit: number }): Promise<DueCalendarSync[]> {
@@ -306,7 +399,9 @@ class FakeReconcilerRepository implements CalendarReconcilerRepository {
   }
 
   async getTenantCalendarContext(): Promise<TenantCalendarContext | null> {
-    return this.context;
+    // Tenant sparito, o lettura del contesto fallita: in entrambi i casi non
+    // c'e' nessuna epoca di proiezione da osservare.
+    return this.contextFailure ? null : this.context;
   }
 
   async claimCalendarSync(input: {
@@ -330,33 +425,6 @@ class FakeReconcilerRepository implements CalendarReconcilerRepository {
 
     return true;
   }
-
-  async updateAppointmentCalendarSync(input: {
-    tenantId: string;
-    appointmentId: string;
-    status: CalendarSyncStatus;
-    eventId?: string;
-    htmlLink?: string | null;
-    errorMessage: string | null;
-    attempts: number;
-    nextAttemptAt: Date | null;
-    lastAttemptAt: Date;
-  }): Promise<void> {
-    const state = this.states.get(input.appointmentId);
-
-    if (!state) {
-      return;
-    }
-
-    this.states.set(input.appointmentId, {
-      ...state,
-      status: input.status,
-      attempts: input.attempts,
-      nextAttemptAt: input.nextAttemptAt,
-      error: input.errorMessage,
-      ...(input.eventId !== undefined ? { eventId: input.eventId } : {}),
-    });
-  }
 }
 
 function dueRow(overrides: Partial<DueCalendarSync> = {}): DueCalendarSync {
@@ -372,6 +440,11 @@ function dueRow(overrides: Partial<DueCalendarSync> = {}): DueCalendarSync {
     customerPhone: '393331112233',
     notes: null,
     attempts: 0,
+    // Autorita' OSSERVATA dallo scanner. La rivendicazione non la sostituisce:
+    // e' questa, piu' la generazione allocata dall'intento, a decidere se
+    // l'esito potra' essere registrato.
+    desiredVersion: 0,
+    calendarEventCalendarId: null,
     ...overrides,
   };
 }

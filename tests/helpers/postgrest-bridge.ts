@@ -37,7 +37,7 @@ import type { TestDatabase } from './postgres';
 
 export type BridgeCall = {
   table: string;
-  verb: 'select' | 'update';
+  verb: 'select' | 'update' | 'rpc';
   /** `true` solo se il chiamante ha chiesto indietro le righe con `.select()`. */
   selectRequested: boolean;
   /** Righe REALMENTE toccate/lette, secondo Postgres. */
@@ -49,7 +49,10 @@ type SupabaseResult<T> = { data: T; error: { code?: string; message?: string } |
 
 export type PostgrestBridge = {
   /** Client da iniettare al posto di `createSupabaseAdminClient()`. */
-  readonly client: { from(table: string): FromBuilder };
+  readonly client: {
+    from(table: string): FromBuilder;
+    rpc(name: string, args: Record<string, unknown>): Promise<SupabaseResult<unknown>>;
+  };
   /** Registro di cio' che e' stato costruito ed eseguito. */
   readonly calls: BridgeCall[];
   reset(): void;
@@ -244,6 +247,45 @@ export function createPostgrestBridge(db: TestDatabase): PostgrestBridge {
             return buildFilterBuilder(table, 'update', patch, null);
           },
         };
+      },
+
+      /**
+       * Chiamata di funzione, come la fa PostgREST.
+       *
+       * Le primitive di PILOT-P0-3C-i vivono nel database e i repository le
+       * raggiungono con `.rpc()`. Senza questo ramo i test dovrebbero
+       * chiamare l'SQL a mano, cioe' saltare esattamente il confine — la
+       * traduzione degli argomenti e il parse dell'esito — che devono
+       * dimostrare.
+       */
+      async rpc(name: string, args: Record<string, unknown>): Promise<SupabaseResult<unknown>> {
+        const named = Object.entries(args)
+          .map(([key, value]) => `${key} := ${literal(value)}`)
+          .join(', ');
+        const sql = `select public.${name}(${named})`;
+
+        try {
+          const raw = db.scalar(sql);
+          const data: unknown = raw && raw.trim() ? JSON.parse(raw) : null;
+
+          calls.push({ table: name, verb: 'rpc', selectRequested: true, affectedRows: 1, sql });
+
+          return { data, error: null };
+        } catch (error) {
+          calls.push({ table: name, verb: 'rpc', selectRequested: true, affectedRows: 0, sql });
+
+          // Lo SQLSTATE e' cio' che il chiamante classifica: `23P01` non e' un
+          // guasto d'infrastruttura ma uno slot occupato, e perderlo qui
+          // renderebbe il test cieco proprio su quella distinzione.
+          const message = error instanceof Error ? error.message : String(error);
+          const code = /appointments_no_confirmed_overlap|23P01|conflicting key|exclusion/i.test(
+            message,
+          )
+            ? '23P01'
+            : undefined;
+
+          return { data: null, error: { message, ...(code ? { code } : {}) } };
+        }
       },
     },
     reset(): void {
